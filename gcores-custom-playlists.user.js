@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         机核自定义播单
 // @namespace    https://www.gcores.com/
-// @version      0.5.1
-// @description  独立于机核原生队列的多播单、断点续播、二维码分享、批量加入与时间轴评论弹幕
+// @version      0.6.0
+// @description  独立多播单、断点进度、专辑批量加入、正倒序、二维码分享与时间轴评论弹幕
 // @author       Codex
 // @match        https://www.gcores.com/*
 // @grant        GM_getValue
@@ -47,7 +47,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 
   function freshState() {
     const id = uid();
-    return { version: 1, activeId: id, playlists: [{ id, name: '我的播单', items: [], cursor: { itemId: null, time: 0 } }] };
+    return { version: 1, activeId: id, playlists: [{ id, name: '我的播单', direction: 'asc', items: [], cursor: { itemId: null, time: 0 } }] };
   }
 
   function normalizeState(raw) {
@@ -68,10 +68,12 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
           duration: Number.isFinite(Number(item.duration)) ? Math.max(0, Number(item.duration)) : 0,
         };
       }).filter(Boolean) : [];
-      const cursorId = itemIds.has(list.cursor?.itemId) ? list.cursor.itemId : items[0]?.id || null;
+      const direction = list.direction === 'desc' ? 'desc' : 'asc';
+      const cursorId = itemIds.has(list.cursor?.itemId) ? list.cursor.itemId : (direction === 'desc' ? items.at(-1) : items[0])?.id || null;
       return {
         id,
         name: cleanText(list.name, '未命名播单'),
+        direction,
         items,
         cursor: {
           itemId: cursorId,
@@ -94,6 +96,16 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   function newItemsForPlaylist(list, items) {
     const seen = new Set(list.items.map((item) => item.id));
     return items.filter((item) => !seen.has(item.id) && seen.add(item.id));
+  }
+
+  function orderedItems(list) {
+    return list.direction === 'desc' ? [...list.items].reverse() : list.items;
+  }
+
+  function moveVisibleItem(list, itemId, offset) {
+    const index = list.items.findIndex((item) => item.id === itemId);
+    const mappedOffset = list.direction === 'desc' ? -offset : offset;
+    if (index >= 0) list.items = moveItem(list.items, index, mappedOffset);
   }
 
   function cleanDanmakuText(body) {
@@ -138,6 +150,12 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (state.playlists[0].name !== 'X' || state.playlists[0].items.length !== 2) throw new Error('normalizeState failed');
     if (moveItem(state.playlists[0].items, 0, 1)[0].id !== '2') throw new Error('moveItem failed');
     if (newItemsForPlaylist(state.playlists[0], [{ id: '2' }, { id: '3' }, { id: '3' }]).length !== 1) throw new Error('playlist deduplication failed');
+    const descending = { direction: 'desc', items: [{ id: '1' }, { id: '2' }, { id: '3' }] };
+    if (orderedItems(descending).map((item) => item.id).join(',') !== '3,2,1') throw new Error('playlist direction failed');
+    const normalizedDescending = normalizeState({ activeId: 'd', playlists: [{ id: 'd', direction: 'desc', items: [{ id: '1' }, { id: '2' }], cursor: {} }] });
+    if (normalizedDescending.playlists[0].cursor.itemId !== '2') throw new Error('descending cursor fallback failed');
+    moveVisibleItem(descending, '2', -1);
+    if (orderedItems(descending).map((item) => item.id).join(',') !== '2,3,1') throw new Error('visible move failed');
     if (cleanDanmakuText('01:15  这是一条评论') !== '这是一条评论') throw new Error('danmaku text cleanup failed');
     if (commentIndexAfter([{ timestamp: 10 }, { timestamp: 20 }], 10) !== 1) throw new Error('danmaku cursor failed');
     let invalidRadioRejected = false;
@@ -163,12 +181,16 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   let shouldAutoplay = false;
   let lastSavedSecond = -Infinity;
   let scanQueued = false;
+  let albumPageType = { id: '', isRadio: null };
+  let albumPageRequest = 0;
   let currentShare = null;
   let importingShare = false;
   let expectedAudioUrl = '';
   let playbackLoading = false;
   let playbackError = '';
   let playbackRequest = 0;
+  let volumePopoverOpen = false;
+  let miniSeekDragging = false;
   let danmakuEnabled = GM_getValue(DANMAKU_KEY, true) !== false;
   let danmakuSession = null;
   let danmakuRequest = 0;
@@ -182,6 +204,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   const activePlaylist = () => state.playlists.find((list) => list.id === state.activeId) || state.playlists[0];
   const playlistById = (id) => state.playlists.find((list) => list.id === id);
   const currentItem = () => playback && playlistById(playback.playlistId)?.items.find((item) => item.id === playback.itemId);
+  const currentAudioSeekable = () => !!playback && !!expectedAudioUrl && audio.src === new URL(expectedAudioUrl, location.href).href && Number.isFinite(audio.duration) && audio.duration > 0 && !playbackLoading && !playbackError;
 
   function imageUrl(path) {
     if (!path) return '';
@@ -242,11 +265,11 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     <style>
       :host{position:fixed;left:50%;bottom:max(18px,env(safe-area-inset-bottom));width:min(720px,calc(100vw - 24px));transform:translateX(-50%);z-index:1040;color:#eee;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
       *{box-sizing:border-box}button,select,input{font:inherit}button{cursor:pointer;transition:transform 140ms cubic-bezier(.23,1,.32,1),background-color 140ms ease}button:active{transform:scale(.97)}button:focus-visible,select:focus-visible,input:focus-visible,.miniCoverLink:focus-visible{outline:2px solid #ff7868;outline-offset:2px}
-      #mini{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(120px,.65fr);align-items:center;gap:16px;height:64px;padding:8px 16px 8px 10px;background:rgba(20,20,20,.62);border:1px solid #ffffff2e;border-radius:18px;box-shadow:0 12px 36px #0007,inset 0 1px #ffffff16;backdrop-filter:saturate(160%) blur(22px);-webkit-backdrop-filter:saturate(160%) blur(22px)}
+      #mini{display:grid;grid-template-columns:minmax(0,1fr) auto 44px;grid-template-rows:48px 26px;align-items:center;column-gap:16px;row-gap:2px;height:88px;padding:6px 12px 6px 10px;background:rgba(20,20,20,.62);border:1px solid #ffffff2e;border-radius:18px;box-shadow:0 12px 36px #0007,inset 0 1px #ffffff16;backdrop-filter:saturate(160%) blur(22px);-webkit-backdrop-filter:saturate(160%) blur(22px)}
       .miniInfo{display:grid;grid-template-columns:46px minmax(0,1fr);align-items:center;gap:10px;min-width:0}.miniCoverLink{display:block;width:46px;height:46px;border-radius:11px;transition:transform 140ms cubic-bezier(.23,1,.32,1)}.miniCoverLink:active{transform:scale(.96)}.miniCover,.miniPlaceholder{width:46px;height:46px;border-radius:11px;object-fit:cover;background:#303030}.miniPlaceholder{display:grid;place-items:center;color:#bbb}.miniPlaceholder svg{width:20px}.miniText{display:block;min-width:0;width:100%;padding:5px 7px;border:0;border-radius:8px;background:transparent;color:inherit;text-align:left}.miniText:hover{background:#ffffff0a}.miniTitle,.miniSub{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.miniTitle{font-weight:700}.miniSub{margin-top:2px;color:#bbb;font-size:11px}
       .miniControls{display:flex;align-items:center;gap:8px}.miniControl{display:grid;place-items:center;width:38px;height:38px;padding:0;border:1px solid #ffffff1f;border-radius:999px;background:#292929;color:#fff}.miniControl.primaryControl{width:42px;height:42px;background:#e05241;border-color:#e05241}.miniControl.primaryControl:hover{background:#ef5b48}.miniControl:disabled{cursor:default;opacity:.35}.miniControl svg{width:15px;height:15px}
-      .miniVolume{display:grid;grid-template-columns:18px minmax(70px,1fr);align-items:center;gap:9px;color:#bbb}.miniVolume svg{width:17px}.miniVolume input{width:100%;accent-color:#e05241;cursor:pointer}
-      #panel{position:absolute;left:50%;bottom:76px;display:none;width:min(390px,calc(100vw - 24px));max-height:min(720px,calc(100vh - 104px));overflow:hidden;transform:translateX(-50%);background:#181818;color:#eee;border:1px solid #ffffff1f;border-radius:16px;box-shadow:0 18px 60px #0009}
+      .miniVolumeWrap{position:relative;display:grid;place-items:center}.miniVolumeButton svg{width:17px;height:17px}.miniVolumePopover{position:absolute;right:50%;bottom:50px;z-index:4;display:flex;width:56px;height:162px;transform:translateX(50%);flex-direction:column;align-items:center;gap:6px;padding:10px 8px;border:1px solid #ffffff2e;border-radius:16px;background:rgba(20,20,20,.82);box-shadow:0 12px 30px #0008;backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%)}.miniVolumeValue{color:#ddd;font-size:10px;font-variant-numeric:tabular-nums}.miniVolumeSlider{width:32px;height:120px;margin:0;accent-color:#e05241;cursor:ns-resize;direction:rtl;touch-action:none;writing-mode:vertical-lr;-webkit-appearance:slider-vertical}.miniProgress{grid-column:1/-1;display:grid;grid-template-columns:42px minmax(0,1fr) 42px;align-items:center;gap:8px;min-width:0;color:#ccc;font-size:11px;font-variant-numeric:tabular-nums}.miniProgress span:last-child{text-align:right}.miniProgress input{width:100%;height:24px;margin:0;accent-color:#e05241;cursor:pointer}.miniProgress input:disabled{cursor:default;opacity:.45}.miniProgressEmpty{grid-column:1/-1}
+      #panel{position:absolute;left:50%;bottom:100px;display:none;width:min(390px,calc(100vw - 24px));max-height:min(720px,calc(100vh - 128px));overflow:hidden;transform:translateX(-50%);background:#181818;color:#eee;border:1px solid #ffffff1f;border-radius:16px;box-shadow:0 18px 60px #0009}
       :host(.open) #panel{display:flex;flex-direction:column}
       header,.toolbar,.now,.footer{padding:12px;border-bottom:1px solid #ffffff18}.footer{border:0;border-top:1px solid #ffffff18}
       header{display:flex;align-items:center;gap:8px}header strong{flex:1;font-size:16px}
@@ -258,7 +281,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       .now{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px}.now img{width:48px;height:48px;border-radius:8px;object-fit:cover;background:#333}.nowTitle{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.progress{grid-column:1/-1;display:grid;grid-template-columns:42px 1fr 42px;gap:7px;align-items:center;font-size:11px;color:#aaa}.progress input{width:100%}
       .controls{grid-column:1/-1;display:flex;justify-content:center;gap:8px}.controls button{min-width:48px}.status{grid-column:1/-1;color:#ffb4aa;font-size:12px;min-height:17px}
       #share[hidden]{display:none}#share{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:14px;background:#000b;border-radius:16px}.shareCard{width:100%;max-height:100%;overflow:auto;padding:16px;border-radius:13px;background:#202020;text-align:center}.shareCard img{display:block;width:min(100%,330px);margin:0 auto 12px;border-radius:8px;background:#fff}.shareCard p{margin:7px 0;color:#aaa;font-size:12px}.shareActions{display:flex;gap:8px;margin-top:12px}.shareActions button{flex:1}
-      @media(max-width:520px){:host{bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px)}#mini{grid-template-columns:minmax(0,1fr) auto 90px;gap:8px;padding-right:10px}.miniInfo{grid-template-columns:42px minmax(0,1fr);gap:8px}.miniCoverLink,.miniCover,.miniPlaceholder{width:42px;height:42px}.miniSub{display:none}.miniControl{width:34px;height:34px}.miniControl.primaryControl{width:38px;height:38px}.miniVolume{grid-template-columns:14px minmax(55px,1fr);gap:5px}.miniVolume svg{width:14px}#panel{bottom:72px;max-height:calc(100vh - 94px)}}
+      @media(max-width:520px){:host{bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px)}#mini{grid-template-columns:minmax(0,1fr) auto 40px;grid-template-rows:44px 26px;column-gap:8px;height:84px;padding:6px 8px}.miniInfo{grid-template-columns:42px minmax(0,1fr);gap:8px}.miniCoverLink,.miniCover,.miniPlaceholder{width:42px;height:42px}.miniSub{display:none}.miniControl{width:34px;height:34px}.miniControl.primaryControl{width:38px;height:38px}.miniVolumePopover{bottom:44px}.miniProgress{grid-template-columns:38px minmax(0,1fr) 38px;gap:5px}#panel{bottom:94px;max-height:calc(100vh - 116px)}}
       @media(prefers-reduced-motion:reduce){button,.miniCoverLink{transition:none}button:active,.miniCoverLink:active{transform:none}}
     </style>
     <div id="mini" aria-label="自定义播单播放器"></div>
@@ -286,15 +309,16 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 
   function render() {
     const list = activePlaylist();
+    const visibleItems = orderedItems(list);
     shadow.querySelector('#toolbar').innerHTML = `
       <select data-action="select-list" aria-label="选择播单">${state.playlists.map((item) => `<option value="${escapeHtml(item.id)}"${item.id === list.id ? ' selected' : ''}>${escapeHtml(item.name)}（${item.items.length}）</option>`).join('')}</select>
       <button data-action="new-list" title="新建播单">＋</button><button data-action="rename-list">修改名字</button><button class="danger" data-action="delete-list">删除播单</button>
-      <div class="actions" style="grid-column:1/-1"><button data-action="share-list"${list.items.length ? '' : ' disabled'}>二维码分享</button><button class="primary" data-action="play-list"${list.items.length ? '' : ' disabled'}>从断点播放</button></div>`;
-    shadow.querySelector('#items').innerHTML = list.items.length ? list.items.map((item, index) => `
+      <div class="actions" style="grid-column:1/-1"><button data-action="toggle-order">排序：${list.direction === 'desc' ? '倒序' : '正序'}</button><button data-action="share-list"${list.items.length ? '' : ' disabled'}>二维码分享</button><button class="primary" data-action="play-list"${list.items.length ? '' : ' disabled'}>从断点播放</button></div>`;
+    shadow.querySelector('#items').innerHTML = visibleItems.length ? visibleItems.map((item) => `
       <div class="item ${playback?.playlistId === list.id && playback.itemId === item.id ? 'playing' : ''}">
         ${item.cover ? `<img src="${escapeHtml(item.cover)}" alt="">` : '<span></span>'}
         <div><div class="title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div><div class="meta">${formatTime(item.duration)}${list.cursor.itemId === item.id && list.cursor.time ? ` · 断点 ${formatTime(list.cursor.time)}` : ''}</div></div>
-        <div class="itemBtns"><button data-action="play-item" data-id="${item.id}" title="播放">▶</button><button data-action="move-up" data-index="${index}" title="上移">↑</button><button data-action="move-down" data-index="${index}" title="下移">↓</button><button class="danger" data-action="remove-item" data-id="${item.id}" title="移除">×</button></div>
+        <div class="itemBtns"><button data-action="play-item" data-id="${item.id}" title="播放">▶</button><button data-action="move-up" data-id="${item.id}" title="上移">↑</button><button data-action="move-down" data-id="${item.id}" title="下移">↓</button><button class="danger" data-action="remove-item" data-id="${item.id}" title="移除">×</button></div>
       </div>`).join('') : '<div class="empty">还没有节目。可从节目卡片或用户页批量添加。</div>';
     renderPlayer();
   }
@@ -311,12 +335,18 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   }
 
   function renderMini() {
+    miniSeekDragging = false;
     const item = currentItem();
     const list = playback ? playlistById(playback.playlistId) : activePlaylist();
-    const displayItem = item || list?.items.find((entry) => entry.id === list.cursor.itemId) || list?.items[0];
-    const index = list ? list.items.findIndex((entry) => entry.id === (playback?.itemId || list.cursor.itemId)) : -1;
+    const visibleItems = list ? orderedItems(list) : [];
+    const displayItem = item || visibleItems.find((entry) => entry.id === list.cursor.itemId) || visibleItems[0];
+    const index = visibleItems.findIndex((entry) => entry.id === (playback?.itemId || list?.cursor.itemId));
     const canStart = !playbackLoading && (!!item || !!list?.items.length);
-    const canNext = !playbackLoading && index >= 0 && index + 1 < list.items.length;
+    const canNext = !playbackLoading && index >= 0 && index + 1 < visibleItems.length;
+    const sourceReady = !!item && currentAudioSeekable();
+    const duration = sourceReady ? audio.duration : Math.max(0, Number(displayItem?.duration || 0));
+    const savedTime = displayItem && list?.cursor.itemId === displayItem.id ? list.cursor.time : 0;
+    const currentTime = duration > 0 ? Math.min(duration, sourceReady && Number.isFinite(audio.currentTime) ? audio.currentTime : savedTime) : 0;
     const playIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M4 2.5v11l9-5.5z"/></svg>';
     const pauseIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M3.5 2.5h3v11h-3zm6 0h3v11h-3z"/></svg>';
     const nextIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M2.5 3v10L10 8zm8 0h3v10h-3z"/></svg>';
@@ -328,7 +358,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
         <button class="miniText" data-action="open-panel" aria-label="打开自定义播单"><span class="miniTitle">${escapeHtml(displayItem?.title || '播单为空')}</span><span class="miniSub">${escapeHtml(playbackLoading ? `${list?.name || '我的播单'} · 正在加载…` : playbackError ? `${list?.name || '我的播单'} · 加载失败，点击重试` : item ? `${list?.name || '我的播单'} · ${audio.paused ? '已暂停' : '正在播放'}` : displayItem ? `${list?.name || '我的播单'} · 从断点播放` : `${list?.name || '我的播单'} · 点击管理`)}</span></button>
       </span>
       <span class="miniControls"><button class="miniControl primaryControl" data-action="mini-toggle" aria-label="${playbackLoading ? '正在加载' : item && !audio.paused ? '暂停' : playbackError ? '重试播放' : '播放'}"${canStart ? '' : ' disabled'}>${item && !audio.paused ? pauseIcon : playIcon}</button><button class="miniControl" data-action="mini-next" aria-label="下一期"${canNext ? '' : ' disabled'}>${nextIcon}</button></span>
-      <label class="miniVolume" aria-label="音量">${volumeIcon}<input id="volume" type="range" min="0" max="1" step="0.05" value="${audio.volume}"></label>`;
+      <span class="miniVolumeWrap"><button class="miniControl miniVolumeButton" data-action="toggle-volume" aria-label="调节音量" aria-expanded="${volumePopoverOpen}" aria-controls="miniVolumePopover">${volumeIcon}</button>${volumePopoverOpen ? `<span class="miniVolumePopover" id="miniVolumePopover" role="dialog" aria-label="音量调节"><span class="miniVolumeValue">${Math.round(audio.volume * 100)}%</span><input class="miniVolumeSlider" id="miniVolumeSlider" type="range" min="0" max="1" step="0.05" value="${audio.volume}" orient="vertical" aria-label="音量"></span>` : ''}</span>
+      ${displayItem ? `<span class="miniProgress"><span id="miniElapsed">${formatTime(currentTime)}</span><input id="miniSeek" type="range" min="0" max="${Math.max(1, duration)}" step="1" value="${Math.min(currentTime, duration || currentTime)}" aria-label="播放进度"${sourceReady ? '' : ' disabled'}><span id="miniDuration">${formatTime(duration)}</span></span>` : '<span class="miniProgressEmpty"></span>'}`;
   }
 
   function setStatus(message) {
@@ -336,10 +367,21 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (node) node.textContent = message;
   }
 
+  function setMiniVolume(value, persist = false) {
+    const volume = Math.min(1, Math.max(0, Number(value)));
+    if (!Number.isFinite(volume)) return;
+    audio.volume = volume;
+    const slider = shadow.querySelector('#miniVolumeSlider');
+    const label = shadow.querySelector('.miniVolumeValue');
+    if (slider) slider.value = String(volume);
+    if (label) label.textContent = `${Math.round(volume * 100)}%`;
+    if (persist) GM_setValue(VOLUME_KEY, volume);
+  }
+
   function shareLink(list) {
     // ponytail: 单个二维码最多 200 期且链接不超过 2800 字节；需要更大播单时再做分片二维码。
     if (!list.items.length || list.items.length > MAX_SHARE_ITEMS) throw new Error(`单个二维码只能分享 1–${MAX_SHARE_ITEMS} 期节目`);
-    const encoded = encodeSharePayload({ v: 1, n: list.name, i: list.items.map((item) => item.id) });
+    const encoded = encodeSharePayload({ v: 1, n: list.name, i: orderedItems(list).map((item) => item.id) });
     const link = `${location.origin}/radios#gcpl=${encoded}`;
     if (new TextEncoder().encode(link).length > MAX_SHARE_LINK_BYTES) throw new Error('播单数据超过单个二维码容量，请减少节目数量或缩短名称');
     return link;
@@ -396,7 +438,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (!items.length) return setStatus('导入失败：未能取得任何节目资料');
     state = normalizeState(GM_getValue(STORAGE_KEY, state));
     const id = uid();
-    state.playlists.push({ id, name: shared.name, items, cursor: { itemId: items[0].id, time: 0 } });
+    state.playlists.push({ id, name: shared.name, direction: 'asc', items, cursor: { itemId: items[0].id, time: 0 } });
     state.activeId = id;
     save();
     render();
@@ -461,8 +503,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   function adjacent(direction) {
     if (!playback) return;
     const list = playlistById(playback.playlistId);
-    const index = list?.items.findIndex((item) => item.id === playback.itemId) ?? -1;
-    const next = list?.items[index + direction];
+    const visibleItems = list ? orderedItems(list) : [];
+    const index = visibleItems.findIndex((item) => item.id === playback.itemId);
+    const next = visibleItems[index + direction];
     if (next) startItem(list, next.id, false);
   }
 
@@ -473,7 +516,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       if (playbackError || !expectedAudioUrl) return list && startItem(list, playback.itemId, true);
       return audio.paused ? audio.play().catch((error) => setStatus(error.message)) : audio.pause();
     }
-    if (fallbackList.items.length) startItem(fallbackList, fallbackList.cursor.itemId || fallbackList.items[0].id, true);
+    if (fallbackList.items.length) startItem(fallbackList, fallbackList.cursor.itemId || orderedItems(fallbackList)[0].id, true);
   }
 
   async function addRadio(id, button) {
@@ -489,7 +532,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       if (!list) throw new Error('目标播单已被删除');
       if (list.items.some((entry) => entry.id === id)) return setStatus('该节目已在目标播单中');
       list.items.push(item);
-      if (!list.cursor.itemId) list.cursor = { itemId: item.id, time: 0 };
+      if (!list.cursor.itemId) list.cursor = { itemId: orderedItems(list)[0].id, time: 0 };
       save();
       render();
       setStatus(`已加入「${list.name}」`);
@@ -548,13 +591,76 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       const additions = newItemsForPlaylist(list, items);
       const wasEmpty = !list.items.length;
       list.items.push(...additions);
-      if (wasEmpty && additions.length) list.cursor = { itemId: additions[0].id, time: 0 };
+      if (wasEmpty && additions.length) list.cursor = { itemId: orderedItems(list)[0].id, time: 0 };
       save();
       render();
       const skipped = items.length - additions.length;
       button.textContent = additions.length ? `已加入 ${additions.length} 期${skipped ? `，跳过 ${skipped} 期` : ''}` : '参与节目已全部在播单中';
     } catch (error) {
       button.textContent = error?.message || '批量加入失败';
+    } finally {
+      setTimeout(() => { if (button.isConnected) { button.disabled = false; button.textContent = originalText; } }, 2500);
+    }
+  }
+
+  async function albumRadios(albumId, onProgress) {
+    const album = await api(`/albums/${encodeURIComponent(albumId)}`);
+    const attributes = album?.data?.attributes;
+    if (album?.data?.type !== 'albums' || attributes?.['content-type'] !== 'radio') throw new Error('这个专辑不是音频播单');
+    const relation = attributes['is-free'] ? 'published-radios' : 'published-audiobooks';
+    const pageSize = 20;
+    const items = new Map();
+    const pageSignatures = new Set();
+    let offset = 0;
+    let total = null;
+    do {
+      const query = new URLSearchParams({
+        'page[limit]': String(pageSize),
+        'page[offset]': String(offset),
+        sort: attributes['is-free'] ? '-published-at' : 'published-at',
+        'fields[radios]': 'title,cover,thumb,duration,published-at',
+      });
+      const result = await api(`/albums/${encodeURIComponent(albumId)}/${relation}?${query}`);
+      const page = Array.isArray(result.data) ? result.data : [];
+      const signature = page.map((resource) => `${resource.type}:${resource.id}`).join(',');
+      if (page.length && pageSignatures.has(signature)) throw new Error('机核接口返回了重复专辑分页');
+      if (page.length) pageSignatures.add(signature);
+      for (const resource of page) {
+        const item = parseRadio({ data: resource }).item;
+        items.set(item.id, item);
+      }
+      const recordCount = Number(result.meta?.['record-count']);
+      if (Number.isFinite(recordCount) && recordCount >= 0) total = recordCount;
+      offset += page.length;
+      onProgress?.(items.size, total);
+      if (!page.length) break;
+    } while (total === null ? offset % pageSize === 0 : offset < total);
+    if (total !== null && items.size !== total) throw new Error(`专辑节目数量不完整（${items.size}/${total}）`);
+    return { items: [...items.values()] };
+  }
+
+  async function addAlbumRadios(albumId, button) {
+    state = normalizeState(GM_getValue(STORAGE_KEY, state));
+    const target = activePlaylist();
+    const targetId = target.id;
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = '正在读取专辑…';
+    try {
+      const result = await albumRadios(albumId, (loaded, total) => { button.textContent = `正在读取 ${loaded}${total === null ? '' : `/${total}`}…`; });
+      state = normalizeState(GM_getValue(STORAGE_KEY, state));
+      const list = playlistById(targetId);
+      if (!list) throw new Error('目标播单已被删除');
+      const additions = newItemsForPlaylist(list, result.items);
+      const wasEmpty = !list.items.length;
+      list.items.push(...additions);
+      if (wasEmpty && additions.length) list.cursor = { itemId: orderedItems(list)[0].id, time: 0 };
+      save();
+      render();
+      const skipped = result.items.length - additions.length;
+      button.textContent = additions.length ? `已加入 ${additions.length} 期${skipped ? `，跳过 ${skipped} 期` : ''}` : '专辑节目已全部在播单中';
+    } catch (error) {
+      button.textContent = error?.message || '专辑加入失败';
     } finally {
       setTimeout(() => { if (button.isConnected) { button.disabled = false; button.textContent = originalText; } }, 2500);
     }
@@ -850,10 +956,42 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     actions.insertAdjacentElement('afterend', button);
   }
 
+  async function scanAlbumPage() {
+    const albumId = location.pathname.match(/^\/albums\/(\d+)/)?.[1];
+    const existing = document.querySelector('.gcpl-add-album');
+    if (!albumId) { existing?.remove(); albumPageType = { id: '', isRadio: null }; return; }
+    if (albumPageType.id !== albumId) {
+      const request = ++albumPageRequest;
+      albumPageType = { id: albumId, isRadio: null };
+      existing?.remove();
+      try {
+        const album = await api(`/albums/${encodeURIComponent(albumId)}`);
+        if (request !== albumPageRequest || location.pathname !== `/albums/${albumId}`) return;
+        albumPageType.isRadio = album?.data?.type === 'albums' && album.data.attributes?.['content-type'] === 'radio';
+      } catch (_) {
+        if (request !== albumPageRequest) return;
+        albumPageType.isRadio = false;
+      }
+      scanAlbumPage();
+      return;
+    }
+    const playAll = [...document.querySelectorAll('.albumDetail_actions button')].find((button) => button.textContent.trim() === '播放全部');
+    if (!playAll || albumPageType.isRadio !== true) { existing?.remove(); return; }
+    if (existing?.dataset.albumId === albumId) return;
+    existing?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-lg btn-secondary btn-ellipse gcpl-add-album';
+    button.dataset.albumId = albumId;
+    button.textContent = '加入当前播单';
+    button.addEventListener('click', () => addAlbumRadios(albumId, button));
+    playAll.insertAdjacentElement('afterend', button);
+  }
+
   function queueScan() {
     if (scanQueued) return;
     scanQueued = true;
-    requestAnimationFrame(() => { scanCards(); scanUserPage(); scanDanmaku(); });
+    requestAnimationFrame(() => { scanCards(); scanUserPage(); scanAlbumPage(); scanDanmaku(); });
   }
 
   shadow.addEventListener('click', (event) => {
@@ -863,10 +1001,15 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (!['close', 'toggle', 'previous', 'next', 'close-share', 'download-qr', 'copy-link'].includes(action)) state = normalizeState(GM_getValue(STORAGE_KEY, state));
     const list = activePlaylist();
     if (action === 'close') host.classList.remove('open');
-    if (action === 'open-panel') { render(); host.classList.add('open'); queueMicrotask(() => shadow.querySelector('[data-action="close"]')?.focus()); }
+    if (action === 'open-panel') { volumePopoverOpen = false; render(); host.classList.add('open'); queueMicrotask(() => shadow.querySelector('[data-action="close"]')?.focus()); }
+    if (action === 'toggle-volume') {
+      volumePopoverOpen = !volumePopoverOpen;
+      renderMini();
+      queueMicrotask(() => shadow.querySelector(volumePopoverOpen ? '#miniVolumeSlider' : '[data-action="toggle-volume"]')?.focus());
+    }
     if (action === 'new-list') {
       const name = cleanText(prompt('新播单名称：'));
-      if (name) { const id = uid(); state.playlists.push({ id, name, items: [], cursor: { itemId: null, time: 0 } }); state.activeId = id; save(); render(); }
+      if (name) { const id = uid(); state.playlists.push({ id, name, direction: 'asc', items: [], cursor: { itemId: null, time: 0 } }); state.activeId = id; save(); render(); }
     }
     if (action === 'rename-list') {
       const name = cleanText(prompt('播单名称：', list.name));
@@ -880,6 +1023,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       save(); render();
     }
     if (action === 'share-list') showShare(list);
+    if (action === 'toggle-order') { list.direction = list.direction === 'desc' ? 'asc' : 'desc'; save(); render(); }
     if (action === 'close-share') shadow.querySelector('#share').hidden = true;
     if (action === 'download-qr' && currentShare) {
       const link = document.createElement('a');
@@ -893,22 +1037,26 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       if (!navigator.clipboard?.writeText) setStatus('当前浏览器不支持复制，请使用二维码分享');
       else navigator.clipboard.writeText(currentShare.link).then(() => setStatus('分享链接已复制')).catch(() => setStatus('复制失败，请使用二维码分享'));
     }
-    if (action === 'play-list' && list.items.length) startItem(list, list.cursor.itemId || list.items[0].id, true);
+    if (action === 'play-list' && list.items.length) startItem(list, list.cursor.itemId || orderedItems(list)[0].id, true);
     if (action === 'play-item') startItem(list, button.dataset.id, list.cursor.itemId === button.dataset.id);
     if (action === 'remove-item') {
-      const index = list.items.findIndex((item) => item.id === button.dataset.id);
-      if (index >= 0) list.items.splice(index, 1);
-      if (list.cursor.itemId === button.dataset.id) list.cursor = { itemId: list.items[Math.min(index, list.items.length - 1)]?.id || null, time: 0 };
+      const visibleIndex = orderedItems(list).findIndex((item) => item.id === button.dataset.id);
+      list.items = list.items.filter((item) => item.id !== button.dataset.id);
+      if (list.cursor.itemId === button.dataset.id) {
+        const remaining = orderedItems(list);
+        list.cursor = { itemId: remaining[Math.min(visibleIndex, remaining.length - 1)]?.id || null, time: 0 };
+      }
       if (playback?.playlistId === list.id && playback.itemId === button.dataset.id) { playbackRequest += 1; audio.pause(); audio.removeAttribute('src'); expectedAudioUrl = ''; playbackLoading = false; playbackError = ''; playback = null; }
       save(); render();
     }
-    if (action === 'move-up' || action === 'move-down') { list.items = moveItem(list.items, Number(button.dataset.index), action === 'move-up' ? -1 : 1); save(); render(); }
+    if (action === 'move-up' || action === 'move-down') { moveVisibleItem(list, button.dataset.id, action === 'move-up' ? -1 : 1); save(); render(); }
     if (action === 'toggle') toggleCurrentPlayback(list);
     if (action === 'mini-toggle') toggleCurrentPlayback(list);
     if (action === 'mini-next') {
       const miniList = playback ? playlistById(playback.playlistId) : list;
-      const index = miniList?.items.findIndex((item) => item.id === (playback?.itemId || miniList.cursor.itemId)) ?? -1;
-      const next = miniList?.items[index + 1];
+      const visibleItems = miniList ? orderedItems(miniList) : [];
+      const index = visibleItems.findIndex((item) => item.id === (playback?.itemId || miniList?.cursor.itemId));
+      const next = visibleItems[index + 1];
       if (next) startItem(miniList, next.id, false);
     }
     if (action === 'previous') adjacent(-1);
@@ -918,13 +1066,44 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   shadow.addEventListener('change', (event) => {
     if (event.target.dataset.action === 'select-list') { state = normalizeState(GM_getValue(STORAGE_KEY, state)); if (playlistById(event.target.value)) state.activeId = event.target.value; save(); render(); }
     if (event.target.id === 'seek' && Number.isFinite(audio.duration)) { audio.currentTime = Math.min(Number(event.target.value), audio.duration); persistProgress(true); }
+    if (event.target.id === 'miniSeek' && currentAudioSeekable()) persistProgress(true);
+    if (event.target.id === 'miniVolumeSlider') setMiniVolume(event.target.value, true);
   });
   shadow.addEventListener('input', (event) => {
-    if (event.target.id !== 'volume') return;
-    const volume = Number(event.target.value);
-    if (!Number.isFinite(volume)) return;
-    audio.volume = Math.min(1, Math.max(0, volume));
-    GM_setValue(VOLUME_KEY, audio.volume);
+    if (event.target.id === 'miniSeek' && currentAudioSeekable()) {
+      const time = Math.min(audio.duration, Math.max(0, Number(event.target.value)));
+      if (Number.isFinite(time)) {
+        audio.currentTime = time;
+        const elapsed = shadow.querySelector('#miniElapsed');
+        if (elapsed) elapsed.textContent = formatTime(time);
+      }
+    }
+    if (event.target.id === 'miniVolumeSlider') {
+      setMiniVolume(event.target.value);
+    }
+  });
+  shadow.addEventListener('pointerdown', (event) => { if (event.target.id === 'miniSeek') miniSeekDragging = true; });
+  shadow.addEventListener('pointerup', (event) => { if (event.target.id === 'miniSeek') { miniSeekDragging = false; if (currentAudioSeekable()) persistProgress(true); } });
+  shadow.addEventListener('pointercancel', (event) => { if (event.target.id === 'miniSeek') miniSeekDragging = false; });
+  shadow.addEventListener('keydown', (event) => {
+    if (event.target.id !== 'miniVolumeSlider') return;
+    const changes = { ArrowUp: 0.05, ArrowRight: 0.05, ArrowDown: -0.05, ArrowLeft: -0.05 };
+    if (event.key === 'Home' || event.key === 'End' || Object.prototype.hasOwnProperty.call(changes, event.key)) {
+      event.preventDefault();
+      const value = event.key === 'Home' ? 0 : event.key === 'End' ? 1 : Math.round((audio.volume + changes[event.key]) * 20) / 20;
+      setMiniVolume(value, true);
+    }
+  });
+  addEventListener('click', (event) => {
+    const insideVolume = event.composedPath().some((node) => node?.classList?.contains?.('miniVolumeWrap'));
+    if (volumePopoverOpen && !insideVolume) { volumePopoverOpen = false; renderMini(); }
+  });
+  addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && volumePopoverOpen) {
+      volumePopoverOpen = false;
+      renderMini();
+      queueMicrotask(() => shadow.querySelector('[data-action="toggle-volume"]')?.focus());
+    }
   });
 
   audio.addEventListener('loadedmetadata', () => {
@@ -940,18 +1119,23 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   audio.addEventListener('play', () => { playbackLoading = false; playbackError = ''; GM_setValue(PLAYBACK_KEY, { owner: TAB_ID, at: Date.now() }); document.querySelectorAll('audio,video').forEach((media) => media.pause()); renderPlayer(); });
   audio.addEventListener('pause', () => { persistProgress(true); renderPlayer(); });
   audio.addEventListener('timeupdate', () => {
-    persistProgress();
+    if (!miniSeekDragging) persistProgress();
     const seek = shadow.querySelector('#seek');
     const elapsed = shadow.querySelector('#elapsed');
     if (seek) seek.value = String(audio.currentTime);
     if (elapsed) elapsed.textContent = formatTime(audio.currentTime);
+    const miniSeek = shadow.querySelector('#miniSeek');
+    const miniElapsed = shadow.querySelector('#miniElapsed');
+    if (miniSeek && !miniSeek.disabled) miniSeek.value = String(audio.currentTime);
+    if (miniElapsed && !miniSeek?.disabled) miniElapsed.textContent = formatTime(audio.currentTime);
   });
   audio.addEventListener('ended', () => {
     state = normalizeState(GM_getValue(STORAGE_KEY, state));
     const list = playback && playlistById(playback.playlistId);
-    const index = list?.items.findIndex((item) => item.id === playback.itemId) ?? -1;
-    if (list?.items[index + 1]) startItem(list, list.items[index + 1].id, false);
-    else if (list) { list.cursor = { itemId: list.items[0]?.id || null, time: 0 }; playback = null; expectedAudioUrl = ''; playbackLoading = false; playbackError = ''; save(); renderPlayer('播单已播放完毕'); }
+    const visibleItems = list ? orderedItems(list) : [];
+    const index = visibleItems.findIndex((item) => item.id === playback?.itemId);
+    if (visibleItems[index + 1]) startItem(list, visibleItems[index + 1].id, false);
+    else if (list) { list.cursor = { itemId: visibleItems[0]?.id || null, time: 0 }; playback = null; expectedAudioUrl = ''; playbackLoading = false; playbackError = ''; save(); renderPlayer('播单已播放完毕'); }
   });
   audio.addEventListener('error', () => { if (expectedAudioUrl) { playbackLoading = false; playbackError = '音频加载失败，请重新播放或检查登录状态'; renderPlayer(playbackError); } });
   document.addEventListener('play', (event) => { if (event.target !== audio && event.target instanceof HTMLMediaElement) audio.pause(); }, true);
