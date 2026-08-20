@@ -30,6 +30,7 @@
 ## 当前任务、追踪与验收链接
 
 - [TASK-001](docs/04-tasks/TASK-001-initialize-project.md)
+- [TASK-002](docs/04-tasks/TASK-002-refresh-user-screenshot.md)
 - [验收标准](docs/02-acceptance/acceptance-criteria.md)
 
 ## 最近验证结果
@@ -40,3 +41,4 @@
 - 截图：四张均来自真实机核页面，登录头像已隐藏。
 - GitHub 仓库 `bilisheep/gcores-custom-playlists` 已公开创建，默认分支为 `main`。
 - README 安装链接和仓库主页均返回 HTTP 200。
+- 用户批量加入截图已重新生成：公开用户头像、名称和按钮可见，当前登录头像及个人搜索内容未进入截图。
