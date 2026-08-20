@@ -1,6 +1,6 @@
 # 项目状态
 
-- 截止：2026-08-20 / v0.5.0
+- 截止：2026-08-20 / v0.5.1
 - 当前实际阶段：完成
 - 当前需求基线：`docs/00-prd/PRD.md`（已确认、已实现）
 
@@ -33,6 +33,7 @@
 - [TASK-001](docs/04-tasks/TASK-001-initialize-project.md)
 - [TASK-002](docs/04-tasks/TASK-002-refresh-user-screenshot.md)
 - [TASK-003](docs/04-tasks/TASK-003-timeline-danmaku.md)
+- [TASK-004](docs/04-tasks/TASK-004-split-mini-player-links.md)
 - [验收标准](docs/02-acceptance/acceptance-criteria.md)
 
 ## 最近验证结果
@@ -45,3 +46,4 @@
 - README 安装链接和仓库主页均返回 HTTP 200。
 - 用户批量加入截图已重新生成：公开用户头像、名称和按钮可见，当前登录头像及个人搜索内容未进入截图。
 - 时间轴弹幕实测：98 条时刻评论加载成功；75 秒触发、暂停冻结、seek 清空、向后重播、开关持久化、减少动态效果、退出卸载和 React 重绘重挂均通过。
+- 底部播放器入口已拆分：封面在新标签打开节目详情，标题打开播单管理；空播单、键盘焦点和移动端布局验证通过。

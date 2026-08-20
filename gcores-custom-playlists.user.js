@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         机核自定义播单
 // @namespace    https://www.gcores.com/
-// @version      0.5.0
+// @version      0.5.1
 // @description  独立于机核原生队列的多播单、断点续播、二维码分享、批量加入与时间轴评论弹幕
 // @author       Codex
 // @match        https://www.gcores.com/*
@@ -140,6 +140,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (newItemsForPlaylist(state.playlists[0], [{ id: '2' }, { id: '3' }, { id: '3' }]).length !== 1) throw new Error('playlist deduplication failed');
     if (cleanDanmakuText('01:15  这是一条评论') !== '这是一条评论') throw new Error('danmaku text cleanup failed');
     if (commentIndexAfter([{ timestamp: 10 }, { timestamp: 20 }], 10) !== 1) throw new Error('danmaku cursor failed');
+    let invalidRadioRejected = false;
+    try { parseRadio({ data: { id: 'not-an-id', type: 'radios', attributes: {} } }); } catch (_) { invalidRadioRejected = true; }
+    if (!invalidRadioRejected) throw new Error('radio ID validation failed');
     const shared = decodeSharePayload(encodeSharePayload({ v: 1, n: '测试播单', i: ['1', '2', '2'] }));
     if (shared.name !== '测试播单' || shared.ids.length !== 2) throw new Error('share codec failed');
     const code = qrcode(0, 'L');
@@ -195,11 +198,13 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   function parseRadio(data) {
     const radio = data?.data;
     if (!radio?.id || radio.type !== 'radios') throw new Error('节目数据格式无法识别');
+    const radioId = String(radio.id);
+    if (!/^\d{1,12}$/.test(radioId)) throw new Error('节目 ID 格式无法识别');
     const mediaId = radio.relationships?.media?.data?.id;
     const media = data.included?.find((item) => item.type === 'medias' && item.id === mediaId);
     return {
       item: {
-        id: String(radio.id),
+        id: radioId,
         title: cleanText(radio.attributes?.title, `节目 ${radio.id}`),
         cover: imageUrl(radio.attributes?.cover || radio.attributes?.thumb),
         duration: Math.max(0, Number(radio.attributes?.duration || media?.attributes?.duration || 0)),
@@ -236,9 +241,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   shadow.innerHTML = `
     <style>
       :host{position:fixed;left:50%;bottom:max(18px,env(safe-area-inset-bottom));width:min(720px,calc(100vw - 24px));transform:translateX(-50%);z-index:1040;color:#eee;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-      *{box-sizing:border-box}button,select,input{font:inherit}button{cursor:pointer;transition:transform 140ms cubic-bezier(.23,1,.32,1),background-color 140ms ease}button:active{transform:scale(.97)}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #ff7868;outline-offset:2px}
+      *{box-sizing:border-box}button,select,input{font:inherit}button{cursor:pointer;transition:transform 140ms cubic-bezier(.23,1,.32,1),background-color 140ms ease}button:active{transform:scale(.97)}button:focus-visible,select:focus-visible,input:focus-visible,.miniCoverLink:focus-visible{outline:2px solid #ff7868;outline-offset:2px}
       #mini{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(120px,.65fr);align-items:center;gap:16px;height:64px;padding:8px 16px 8px 10px;background:rgba(20,20,20,.62);border:1px solid #ffffff2e;border-radius:18px;box-shadow:0 12px 36px #0007,inset 0 1px #ffffff16;backdrop-filter:saturate(160%) blur(22px);-webkit-backdrop-filter:saturate(160%) blur(22px)}
-      .miniInfo{display:grid;grid-template-columns:46px minmax(0,1fr);align-items:center;gap:10px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left}.miniInfo:hover{background:#ffffff0a}.miniCover,.miniPlaceholder{width:46px;height:46px;border-radius:11px;object-fit:cover;background:#303030}.miniPlaceholder{display:grid;place-items:center;color:#bbb}.miniPlaceholder svg{width:20px}.miniText{min-width:0}.miniTitle,.miniSub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.miniTitle{font-weight:700}.miniSub{margin-top:2px;color:#bbb;font-size:11px}
+      .miniInfo{display:grid;grid-template-columns:46px minmax(0,1fr);align-items:center;gap:10px;min-width:0}.miniCoverLink{display:block;width:46px;height:46px;border-radius:11px;transition:transform 140ms cubic-bezier(.23,1,.32,1)}.miniCoverLink:active{transform:scale(.96)}.miniCover,.miniPlaceholder{width:46px;height:46px;border-radius:11px;object-fit:cover;background:#303030}.miniPlaceholder{display:grid;place-items:center;color:#bbb}.miniPlaceholder svg{width:20px}.miniText{display:block;min-width:0;width:100%;padding:5px 7px;border:0;border-radius:8px;background:transparent;color:inherit;text-align:left}.miniText:hover{background:#ffffff0a}.miniTitle,.miniSub{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.miniTitle{font-weight:700}.miniSub{margin-top:2px;color:#bbb;font-size:11px}
       .miniControls{display:flex;align-items:center;gap:8px}.miniControl{display:grid;place-items:center;width:38px;height:38px;padding:0;border:1px solid #ffffff1f;border-radius:999px;background:#292929;color:#fff}.miniControl.primaryControl{width:42px;height:42px;background:#e05241;border-color:#e05241}.miniControl.primaryControl:hover{background:#ef5b48}.miniControl:disabled{cursor:default;opacity:.35}.miniControl svg{width:15px;height:15px}
       .miniVolume{display:grid;grid-template-columns:18px minmax(70px,1fr);align-items:center;gap:9px;color:#bbb}.miniVolume svg{width:17px}.miniVolume input{width:100%;accent-color:#e05241;cursor:pointer}
       #panel{position:absolute;left:50%;bottom:76px;display:none;width:min(390px,calc(100vw - 24px));max-height:min(720px,calc(100vh - 104px));overflow:hidden;transform:translateX(-50%);background:#181818;color:#eee;border:1px solid #ffffff1f;border-radius:16px;box-shadow:0 18px 60px #0009}
@@ -253,8 +258,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       .now{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px}.now img{width:48px;height:48px;border-radius:8px;object-fit:cover;background:#333}.nowTitle{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.progress{grid-column:1/-1;display:grid;grid-template-columns:42px 1fr 42px;gap:7px;align-items:center;font-size:11px;color:#aaa}.progress input{width:100%}
       .controls{grid-column:1/-1;display:flex;justify-content:center;gap:8px}.controls button{min-width:48px}.status{grid-column:1/-1;color:#ffb4aa;font-size:12px;min-height:17px}
       #share[hidden]{display:none}#share{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:14px;background:#000b;border-radius:16px}.shareCard{width:100%;max-height:100%;overflow:auto;padding:16px;border-radius:13px;background:#202020;text-align:center}.shareCard img{display:block;width:min(100%,330px);margin:0 auto 12px;border-radius:8px;background:#fff}.shareCard p{margin:7px 0;color:#aaa;font-size:12px}.shareActions{display:flex;gap:8px;margin-top:12px}.shareActions button{flex:1}
-      @media(max-width:520px){:host{bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px)}#mini{grid-template-columns:minmax(0,1fr) auto 90px;gap:8px;padding-right:10px}.miniInfo{grid-template-columns:42px minmax(0,1fr);gap:8px}.miniCover,.miniPlaceholder{width:42px;height:42px}.miniSub{display:none}.miniControl{width:34px;height:34px}.miniControl.primaryControl{width:38px;height:38px}.miniVolume{grid-template-columns:14px minmax(55px,1fr);gap:5px}.miniVolume svg{width:14px}#panel{bottom:72px;max-height:calc(100vh - 94px)}}
-      @media(prefers-reduced-motion:reduce){button{transition:none}button:active{transform:none}}
+      @media(max-width:520px){:host{bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px)}#mini{grid-template-columns:minmax(0,1fr) auto 90px;gap:8px;padding-right:10px}.miniInfo{grid-template-columns:42px minmax(0,1fr);gap:8px}.miniCoverLink,.miniCover,.miniPlaceholder{width:42px;height:42px}.miniSub{display:none}.miniControl{width:34px;height:34px}.miniControl.primaryControl{width:38px;height:38px}.miniVolume{grid-template-columns:14px minmax(55px,1fr);gap:5px}.miniVolume svg{width:14px}#panel{bottom:72px;max-height:calc(100vh - 94px)}}
+      @media(prefers-reduced-motion:reduce){button,.miniCoverLink{transition:none}button:active,.miniCoverLink:active{transform:none}}
     </style>
     <div id="mini" aria-label="自定义播单播放器"></div>
     <section id="panel" aria-label="机核自定义播单">
@@ -318,10 +323,10 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     const musicIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M12.5 2v7.4a2.6 2.6 0 1 1-1.5-2.35V4.4L6.5 5.5v5.9A2.6 2.6 0 1 1 5 9.05V4.3z"/></svg>';
     const volumeIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M2 6h3l3-2.5v9L5 10H2zm8.2-.9a4.2 4.2 0 0 1 0 5.8l-1-1.1a2.7 2.7 0 0 0 0-3.6zm2-2a7 7 0 0 1 0 9.8l-1-1.1a5.5 5.5 0 0 0 0-7.6z"/></svg>';
     shadow.querySelector('#mini').innerHTML = `
-      <button class="miniInfo" data-action="open-panel" aria-label="打开我的播单">
-        ${displayItem?.cover ? `<img class="miniCover" src="${escapeHtml(displayItem.cover)}" alt="">` : `<span class="miniPlaceholder">${musicIcon}</span>`}
-        <span class="miniText"><span class="miniTitle">${escapeHtml(displayItem?.title || '播单为空')}</span><span class="miniSub">${escapeHtml(playbackLoading ? `${list?.name || '我的播单'} · 正在加载…` : playbackError ? `${list?.name || '我的播单'} · 加载失败，点击重试` : item ? `${list?.name || '我的播单'} · ${audio.paused ? '已暂停' : '正在播放'}` : displayItem ? `${list?.name || '我的播单'} · 从断点播放` : `${list?.name || '我的播单'} · 点击管理`)}</span></span>
-      </button>
+      <span class="miniInfo">
+        ${displayItem ? `<a class="miniCoverLink" href="/radios/${escapeHtml(displayItem.id)}" target="_blank" rel="noopener noreferrer" aria-label="打开节目详情：${escapeHtml(displayItem.title)}">${displayItem.cover ? `<img class="miniCover" src="${escapeHtml(displayItem.cover)}" alt="">` : `<span class="miniPlaceholder">${musicIcon}</span>`}</a>` : `<span class="miniPlaceholder">${musicIcon}</span>`}
+        <button class="miniText" data-action="open-panel" aria-label="打开自定义播单"><span class="miniTitle">${escapeHtml(displayItem?.title || '播单为空')}</span><span class="miniSub">${escapeHtml(playbackLoading ? `${list?.name || '我的播单'} · 正在加载…` : playbackError ? `${list?.name || '我的播单'} · 加载失败，点击重试` : item ? `${list?.name || '我的播单'} · ${audio.paused ? '已暂停' : '正在播放'}` : displayItem ? `${list?.name || '我的播单'} · 从断点播放` : `${list?.name || '我的播单'} · 点击管理`)}</span></button>
+      </span>
       <span class="miniControls"><button class="miniControl primaryControl" data-action="mini-toggle" aria-label="${playbackLoading ? '正在加载' : item && !audio.paused ? '暂停' : playbackError ? '重试播放' : '播放'}"${canStart ? '' : ' disabled'}>${item && !audio.paused ? pauseIcon : playIcon}</button><button class="miniControl" data-action="mini-next" aria-label="下一期"${canNext ? '' : ' disabled'}>${nextIcon}</button></span>
       <label class="miniVolume" aria-label="音量">${volumeIcon}<input id="volume" type="range" min="0" max="1" step="0.05" value="${audio.volume}"></label>`;
   }
