@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         机核自定义播单
 // @namespace    https://www.gcores.com/
-// @version      0.4.3
-// @description  独立于机核原生队列的多播单、连续播放、断点续播、二维码分享与用户参与节目批量加入
+// @version      0.5.0
+// @description  独立于机核原生队列的多播单、断点续播、二维码分享、批量加入与时间轴评论弹幕
 // @author       Codex
 // @match        https://www.gcores.com/*
 // @grant        GM_getValue
@@ -28,11 +28,15 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   const STORAGE_KEY = 'gcores-custom-playlists-v1';
   const PLAYBACK_KEY = 'gcores-custom-playlists-playing-v1';
   const VOLUME_KEY = 'gcores-custom-playlists-volume-v1';
+  const DANMAKU_KEY = 'gcores-custom-playlists-danmaku-enabled-v1';
   const API_ROOT = '/gapi/v1';
   const SAVE_INTERVAL_SECONDS = 5;
   const MAX_SHARE_ITEMS = 200;
   const MAX_SHARE_LINK_BYTES = 2800;
   const MAX_SHARE_ENCODED_LENGTH = 4000;
+  const DANMAKU_LANES = 4;
+  const DANMAKU_DURATION_MS = 8000;
+  const DANMAKU_PAGE_SIZE = 100;
 
   const uid = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const TAB_ID = uid();
@@ -92,6 +96,26 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     return items.filter((item) => !seen.has(item.id) && seen.add(item.id));
   }
 
+  function cleanDanmakuText(body) {
+    const text = cleanText(body)
+      .replace(/^\s*[\[（(]?\d{1,3}[:：]\d{2}(?:[:：]\d{2})?[\]）)]?\s*/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const characters = [...text];
+    return characters.length > 80 ? `${characters.slice(0, 79).join('')}…` : text;
+  }
+
+  function commentIndexAfter(comments, time) {
+    let low = 0;
+    let high = comments.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (comments[middle].timestamp <= time) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+
   function encodeSharePayload(payload) {
     const bytes = new TextEncoder().encode(JSON.stringify(payload));
     return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -114,6 +138,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (state.playlists[0].name !== 'X' || state.playlists[0].items.length !== 2) throw new Error('normalizeState failed');
     if (moveItem(state.playlists[0].items, 0, 1)[0].id !== '2') throw new Error('moveItem failed');
     if (newItemsForPlaylist(state.playlists[0], [{ id: '2' }, { id: '3' }, { id: '3' }]).length !== 1) throw new Error('playlist deduplication failed');
+    if (cleanDanmakuText('01:15  这是一条评论') !== '这是一条评论') throw new Error('danmaku text cleanup failed');
+    if (commentIndexAfter([{ timestamp: 10 }, { timestamp: 20 }], 10) !== 1) throw new Error('danmaku cursor failed');
     const shared = decodeSharePayload(encodeSharePayload({ v: 1, n: '测试播单', i: ['1', '2', '2'] }));
     if (shared.name !== '测试播单' || shared.ids.length !== 2) throw new Error('share codec failed');
     const code = qrcode(0, 'L');
@@ -140,6 +166,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   let playbackLoading = false;
   let playbackError = '';
   let playbackRequest = 0;
+  let danmakuEnabled = GM_getValue(DANMAKU_KEY, true) !== false;
+  let danmakuSession = null;
+  let danmakuRequest = 0;
 
   const audio = new Audio();
   audio.preload = 'metadata';
@@ -238,7 +267,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 
   const style = document.createElement('style');
   style.id = 'gcpl-site-style';
-  style.textContent = `.gcpl-add-card{position:absolute!important;top:8px;right:44px;z-index:4;display:flex;width:28px;height:28px;align-items:center;justify-content:center;border:0;border-radius:4px;padding:0;background:#0003;color:#fff;cursor:pointer}.gcpl-add-card svg{width:15px;height:15px}.gcpl-add-card:hover{background:#e34d3b}.gcpl-add-card:disabled{opacity:.6}.gcpl-add-user-radios{display:block!important;width:100%;margin-top:10px}.original_imgArea{position:relative}`;
+  style.textContent = `.gcpl-add-card{position:absolute!important;top:8px;right:44px;z-index:4;display:flex;width:28px;height:28px;align-items:center;justify-content:center;border:0;border-radius:4px;padding:0;background:#0003;color:#fff;cursor:pointer}.gcpl-add-card svg{width:15px;height:15px}.gcpl-add-card:hover{background:#e34d3b}.gcpl-add-card:disabled{opacity:.6}.gcpl-add-user-radios{display:block!important;width:100%;margin-top:10px}.original_imgArea{position:relative}.gcpl-danmaku-host{position:relative!important}.gcpl-danmaku-layer{position:absolute;inset:0;z-index:8;overflow:hidden;pointer-events:none}.gcpl-danmaku-item{position:absolute;left:0;display:inline-block;max-width:80vw;overflow:hidden;padding:7px 13px;border:1px solid #ffffff2e;border-radius:999px;background:rgba(14,14,14,.58);box-shadow:0 5px 18px #0006;color:#fff;font:600 15px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em;text-overflow:ellipsis;text-shadow:0 1px 2px #000;white-space:nowrap;will-change:transform,opacity;backdrop-filter:blur(12px) saturate(150%);-webkit-backdrop-filter:blur(12px) saturate(150%)}.gcpl-danmaku-item-static{left:50%;transform:translateX(-50%);max-width:min(760px,80vw)}.gcpl-danmaku-toggle{margin-left:8px!important}.gcpl-danmaku-toggle[aria-pressed="true"]{color:#fff!important;background:#ffffff24!important}@media(prefers-reduced-transparency:reduce){.gcpl-danmaku-item{background:#1b1b1bf2;backdrop-filter:none;-webkit-backdrop-filter:none}}@media(prefers-contrast:more){.gcpl-danmaku-item{background:#000;border-color:#fff}}`;
   document.head.append(style);
 
   function formatTime(seconds) {
@@ -526,6 +555,261 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     }
   }
 
+  async function timedComments(radioId) {
+    const comments = new Map();
+    const pageSignatures = new Set();
+    let offset = 0;
+    let total = null;
+    do {
+      const query = new URLSearchParams({
+        'page[limit]': String(DANMAKU_PAGE_SIZE),
+        'page[offset]': String(offset),
+        sort: 'radio-timestamp',
+        'filter[timed]': '1',
+        'fields[comments]': 'body,radio-timestamp',
+      });
+      const result = await api(`/radios/${encodeURIComponent(radioId)}/comments?${query}`);
+      const page = Array.isArray(result.data) ? result.data : [];
+      const signature = page.map((resource) => `${resource.type}:${resource.id}`).join(',');
+      if (page.length && pageSignatures.has(signature)) throw new Error('机核接口返回了重复评论分页');
+      if (page.length) pageSignatures.add(signature);
+      for (const resource of page) {
+        const timestamp = Number(resource?.attributes?.['radio-timestamp']);
+        const text = cleanDanmakuText(resource?.attributes?.body);
+        if (resource?.type === 'comments' && /^\d{1,12}$/.test(resource.id) && Number.isFinite(timestamp) && timestamp >= 0 && text) {
+          comments.set(resource.id, { id: resource.id, timestamp, text });
+        }
+      }
+      const recordCount = Number(result.meta?.['record-count']);
+      if (Number.isFinite(recordCount) && recordCount >= 0) total = recordCount;
+      offset += page.length;
+      if (!page.length) break;
+    } while (total === null ? offset % DANMAKU_PAGE_SIZE === 0 : offset < total);
+    return [...comments.values()].sort((left, right) => left.timestamp - right.timestamp || Number(left.id) - Number(right.id));
+  }
+
+  function clearDanmaku(session = danmakuSession) {
+    if (!session) return;
+    for (const lane of session.lanes) {
+      if (!lane) continue;
+      lane.animation.onfinish = null;
+      lane.animation.cancel();
+      lane.node.remove();
+    }
+    session.lanes = Array(DANMAKU_LANES).fill(null);
+    session.root.replaceChildren();
+  }
+
+  function resetDanmaku(session, time = session.audio.currentTime) {
+    clearDanmaku(session);
+    const safeTime = Number.isFinite(time) ? Math.max(0, time) : 0;
+    session.cursor = commentIndexAfter(session.comments, safeTime);
+    session.lastTime = safeTime;
+  }
+
+  function syncDanmakuAnimations(session, action) {
+    for (const lane of session.lanes) {
+      if (!lane) continue;
+      if (action === 'play') lane.animation.play();
+      if (action === 'pause') lane.animation.pause();
+      if (action === 'rate') lane.animation.playbackRate = Math.min(4, Math.max(0.25, session.audio.playbackRate || 1));
+    }
+  }
+
+  function spawnDanmaku(session, comment) {
+    if (!danmakuEnabled || session !== danmakuSession || !session.root.isConnected) return;
+    const laneIndex = session.lanes.findIndex((lane) => !lane);
+    if (laneIndex < 0) return;
+    const node = document.createElement('span');
+    node.className = 'gcpl-danmaku-item';
+    node.textContent = comment.text;
+    node.dataset.commentId = comment.id;
+    node.dataset.timestamp = String(comment.timestamp);
+    node.style.top = `${18 + laneIndex * 45}px`;
+    session.root.append(node);
+    if (typeof node.animate !== 'function') { node.remove(); return; }
+    const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let animation;
+    if (reducedMotion) {
+      node.classList.add('gcpl-danmaku-item-static');
+      animation = node.animate([
+        { opacity: 0 },
+        { opacity: 1, offset: 0.12 },
+        { opacity: 1, offset: 0.78 },
+        { opacity: 0 },
+      ], { duration: 4000, easing: 'linear', fill: 'forwards' });
+    } else {
+      const rootWidth = session.root.getBoundingClientRect().width;
+      const nodeWidth = node.getBoundingClientRect().width;
+      if (!(rootWidth > 0 && nodeWidth > 0)) { node.remove(); return; }
+      animation = node.animate([
+        { transform: `translateX(${rootWidth}px)` },
+        { transform: `translateX(${-nodeWidth}px)` },
+      ], { duration: DANMAKU_DURATION_MS, easing: 'linear', fill: 'forwards' });
+    }
+    animation.playbackRate = Math.min(4, Math.max(0.25, session.audio.playbackRate || 1));
+    if (session.audio.paused) animation.pause();
+    const lane = { animation, node };
+    session.lanes[laneIndex] = lane;
+    animation.onfinish = () => {
+      if (session.lanes[laneIndex] === lane) session.lanes[laneIndex] = null;
+      node.remove();
+    };
+  }
+
+  function handleDanmakuTime(session) {
+    if (!danmakuEnabled || !session.loaded || session.seeking || session !== danmakuSession) return;
+    const currentTime = session.audio.currentTime;
+    if (!Number.isFinite(currentTime)) return;
+    if (!Number.isFinite(session.lastTime) || currentTime < session.lastTime) {
+      resetDanmaku(session, currentTime);
+      return;
+    }
+    while (session.cursor < session.comments.length && session.comments[session.cursor].timestamp <= currentTime) {
+      const comment = session.comments[session.cursor];
+      if (comment.timestamp > session.lastTime) spawnDanmaku(session, comment);
+      session.cursor += 1;
+    }
+    session.lastTime = currentTime;
+  }
+
+  function updateDanmakuToggle(session) {
+    const button = session.button;
+    if (!button?.isConnected) return;
+    button.setAttribute('aria-pressed', String(danmakuEnabled));
+    button.disabled = false;
+    button.textContent = session.loading
+      ? '弹幕：加载中'
+      : session.error && danmakuEnabled
+        ? '弹幕：重试'
+        : danmakuEnabled
+          ? `弹幕：开${session.loaded ? ` ${session.comments.length}` : ''}`
+          : '弹幕：关';
+  }
+
+  async function loadDanmakuComments(session) {
+    if (session.loading || session !== danmakuSession) return;
+    const request = ++danmakuRequest;
+    session.loading = true;
+    session.error = false;
+    updateDanmakuToggle(session);
+    try {
+      const comments = await timedComments(session.radioId);
+      if (request !== danmakuRequest || session !== danmakuSession || !danmakuEnabled) return;
+      session.comments = comments;
+      session.loaded = true;
+      resetDanmaku(session);
+    } catch (_) {
+      if (request === danmakuRequest && session === danmakuSession) {
+        session.error = true;
+        session.loaded = false;
+      }
+    } finally {
+      if (request === danmakuRequest && session === danmakuSession) {
+        session.loading = false;
+        updateDanmakuToggle(session);
+      }
+    }
+  }
+
+  function setDanmakuEnabled(enabled, session = danmakuSession) {
+    danmakuEnabled = enabled;
+    if (!session) return;
+    if (!enabled) {
+      danmakuRequest += 1;
+      session.loading = false;
+      resetDanmaku(session);
+    } else if (session.loaded) {
+      resetDanmaku(session);
+    } else {
+      loadDanmakuComments(session);
+    }
+    updateDanmakuToggle(session);
+  }
+
+  function ensureDanmakuToggle(session) {
+    if (session.button?.isConnected) return;
+    const actions = document.querySelector('.playerFullscreenHeader_actions');
+    if (!actions) return;
+    const oldButton = document.querySelector('.gcpl-danmaku-toggle');
+    oldButton?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-opacity fa-sm rounded-max gcpl-danmaku-toggle';
+    button.addEventListener('click', () => {
+      if (session.error && danmakuEnabled) {
+        session.error = false;
+        loadDanmakuComments(session);
+        return;
+      }
+      const next = !danmakuEnabled;
+      GM_setValue(DANMAKU_KEY, next);
+      setDanmakuEnabled(next, session);
+    });
+    actions.append(button);
+    session.button = button;
+    updateDanmakuToggle(session);
+  }
+
+  function teardownDanmaku() {
+    const session = danmakuSession;
+    if (!session) return;
+    danmakuRequest += 1;
+    for (const [event, handler] of Object.entries(session.handlers)) session.audio.removeEventListener(event, handler);
+    clearDanmaku(session);
+    session.button?.remove();
+    session.root.remove();
+    session.body.classList.remove('gcpl-danmaku-host');
+    danmakuSession = null;
+  }
+
+  function scanDanmaku() {
+    const radioId = location.pathname.match(/^\/radios\/(\d+)\/timelines/)?.[1];
+    const body = document.querySelector('.playerFullscreenTimelineBody');
+    const officialAudio = document.querySelector('audio');
+    if (!radioId || !body || !officialAudio) { teardownDanmaku(); return; }
+    if (danmakuSession?.radioId === radioId && danmakuSession.body === body && danmakuSession.audio === officialAudio && danmakuSession.root.isConnected && danmakuSession.root.parentElement === body) {
+      body.classList.add('gcpl-danmaku-host');
+      ensureDanmakuToggle(danmakuSession);
+      return;
+    }
+    teardownDanmaku();
+    body.classList.add('gcpl-danmaku-host');
+    const root = document.createElement('div');
+    root.className = 'gcpl-danmaku-layer';
+    root.setAttribute('aria-hidden', 'true');
+    body.append(root);
+    const session = {
+      radioId,
+      body,
+      root,
+      audio: officialAudio,
+      button: null,
+      comments: [],
+      cursor: 0,
+      lastTime: Number.isFinite(officialAudio.currentTime) ? officialAudio.currentTime : 0,
+      lanes: Array(DANMAKU_LANES).fill(null),
+      loaded: false,
+      loading: false,
+      error: false,
+      seeking: false,
+      handlers: {},
+    };
+    session.handlers = {
+      timeupdate: () => handleDanmakuTime(session),
+      seeking: () => { session.seeking = true; clearDanmaku(session); },
+      seeked: () => { session.seeking = false; resetDanmaku(session); },
+      play: () => syncDanmakuAnimations(session, 'play'),
+      pause: () => syncDanmakuAnimations(session, 'pause'),
+      ratechange: () => syncDanmakuAnimations(session, 'rate'),
+      ended: () => resetDanmaku(session, 0),
+    };
+    for (const [event, handler] of Object.entries(session.handlers)) officialAudio.addEventListener(event, handler);
+    danmakuSession = session;
+    ensureDanmakuToggle(session);
+    if (danmakuEnabled) loadDanmakuComments(session);
+  }
+
   function scanCards() {
     scanQueued = false;
     document.querySelectorAll('.original:not([data-gcpl-ready])').forEach((card) => {
@@ -564,7 +848,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   function queueScan() {
     if (scanQueued) return;
     scanQueued = true;
-    requestAnimationFrame(() => { scanCards(); scanUserPage(); });
+    requestAnimationFrame(() => { scanCards(); scanUserPage(); scanDanmaku(); });
   }
 
   shadow.addEventListener('click', (event) => {
@@ -667,6 +951,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   audio.addEventListener('error', () => { if (expectedAudioUrl) { playbackLoading = false; playbackError = '音频加载失败，请重新播放或检查登录状态'; renderPlayer(playbackError); } });
   document.addEventListener('play', (event) => { if (event.target !== audio && event.target instanceof HTMLMediaElement) audio.pause(); }, true);
   addEventListener('pagehide', () => persistProgress(true));
+  addEventListener('pagehide', teardownDanmaku);
+  addEventListener('pageshow', queueScan);
 
   if ('mediaSession' in navigator) [
     ['play', () => audio.play()],
@@ -707,6 +993,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   GM_addValueChangeListener(VOLUME_KEY, (_key, _oldValue, newValue, remote) => {
     const volume = Number(newValue);
     if (remote && Number.isFinite(volume)) { audio.volume = Math.min(1, Math.max(0, volume)); renderMini(); }
+  });
+  GM_addValueChangeListener(DANMAKU_KEY, (_key, _oldValue, newValue, remote) => {
+    if (remote) setDanmakuEnabled(newValue !== false);
   });
   addEventListener('hashchange', importSharedPlaylist);
   queueScan();
