@@ -56,3 +56,4 @@
 
 - 专辑页默认标签不能用于判断专辑类型：混合专辑也可能只渲染 `/radios/` 链接。挂载批量按钮前必须读取 `/albums/{id}`，以 `attributes.content-type === 'radio'` 为准；切换 SPA 路由时用请求序号丢弃过期结果。
 - `renderMini()` 会替换原生进度滑杆。任何重绘都必须先清除拖动标志，否则旧滑杆收不到 `pointerup` 时会永久停止定时进度保存。
+- `/albums` 是服务端渲染后由 React hydration 接管的页面；脚本过早插入“我的”页签会触发 React 418/425。等待 hydration 稳定后再挂载，并只隐藏官方 sibling、不删除或搬移 React 节点。

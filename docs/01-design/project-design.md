@@ -10,9 +10,10 @@
 - 播单状态层：Tampermonkey `GM_*` 存储版本化播单、断点、音量和跨标签播放信号。
 - 数据访问层：只读调用机核节目详情、搜索和受保护媒体授权接口。
 - 播放层：单一 `Audio` 实例负责载入、播放、跳转、错误和 Media Session。
-- UI 层：Shadow DOM 隔离底部播放器、管理面板和二维码界面。
+- UI 层：Shadow DOM 隔离底部播放器和二维码界面；本地播单库与详情作为官方 `/albums` 主内容区的普通 DOM sibling。
 - 时间轴弹幕层：挂载到官方 `.playerFullscreenTimelineBody`，读取官方 `<audio>` 的播放事件和 `currentTime`，只在全屏时间轴生命周期内存在。
 - 专辑导入层：识别 `/albums/{id}` 和 `content-type=radio`，分页读取官方已发布音频关系，完整成功后写入当前播单。
+- 官方播单页集成层：在 `/albums` 的 `.labelFilters ul` 首位挂载“我的”，并在本地路由下以独立 sibling 容器替换主内容展示；官方 filter 页面不改动原列表、分页或接口。
 
 ## 功能模块划分与协作
 
@@ -20,17 +21,26 @@
 
 弹幕模块从时间轴路由取得节目 ID → 分页读取 `filter[timed]=1` 评论 → 以 `radio-timestamp` 排序 → 监听官方音频进度跨越 → 分配空闲轨道并创建 CSS/WAAPI 动画。暂停/继续直接控制已有动画；seek 清空节点并重建触发游标。
 
-底部播放器左侧遵循一对一交互映射：封面是指向 `/radios/{id}` 的节目详情链接；标题与播单副标题是打开 Shadow DOM 管理面板的按钮。空播单没有节目详情链接，但标题区域仍可打开管理面板。
+底部播放器左侧遵循一对一交互映射：封面是指向 `/radios/{id}` 的节目详情链接；标题与播单副标题进入当前显示或播放所属本地播单的 `/albums?gcpl={playlistId}` 完整详情页。空播单没有节目详情链接，但标题区域仍进入当前播单详情。
 
 底部播放器采用两行网格：主行是节目入口、传输控制和音量图标，第二行是时间文本与原生 range 进度。竖直音量弹层使用原生 range、垂直 writing-mode 和浏览器自带 Pointer/键盘行为，音量 input 实时生效、change 时写入 GM 存储；进度 input 实时 seek，change 时保存。未加载状态显示播单 cursor 但禁用进度，不创建额外音频实例。
 
 播单 `items` 始终保存规范/手动顺序，`direction` 只接受 `asc` 或 `desc`。`orderedItems(list)` 为渲染、播放、上一期/下一期和分享提供可见顺序；倒序通过派生反向数组实现，不修改事实源。移动按钮把可见方向偏移映射回规范数组。
+
+播单新增可选 `cover` data URL。`normalizeState()` 只接受受限长度的 JPEG/PNG/WebP 图片 data URL，旧数据和无封面数据归一化为空字符串。播单库优先展示自定义封面，其次展示当前可见首期节目封面，最后展示已有音乐占位图；封面字段不进入分享载荷。
+
+`/albums` 无 `filter` 和无 `gcpl` 时为本地库；脚本等待 1.5 秒让 React hydration 完成，再在官方“机核 / 入驻”之前加入“我的”并标记 active，隐藏官方结果 sibling 与分页但不删除或搬移 React 节点，再插入 `gcpl-page-root`。本地库复用官方 `row-cols-*`、`coverShowcase`、`albumGolden`、封面和标题结构，额外 CSS 只提供本地标识、节目数和封面操作。`filter=gcores|join` 时移除脚本内容并恢复官方节点。
+
+本地详情使用 `/albums?gcpl={playlistId}`，同样占 `.ah_section` 主内容区，并复用 albumDetail 的封面、标题、操作区和节目列表视觉；库到详情使用 History API，`popstate`、SPA 扫描和刷新均按 URL 恢复。ID 无效时 `replaceState` 回 `/albums`。固定 Shadow host 只保留底栏、音量和二维码等二级界面，不再承载播单库或管理详情。
+
+图片选择复用隐藏的原生 file input、Object URL、Image 和 Canvas：限制原始文件为图片且不超过 8 MiB，按中心裁切为 320×320 JPEG，再限制 data URL 长度约 300 KiB。处理成功后重新读取 GM 状态并按 playlist ID 写入，避免覆盖跨标签页变化；失败只更新当前状态提示。
 
 ## 核心数据流
 
 ```text
 机核页面/API → 节目元数据 → GM 播单存储 → 自定义播放器
 GM 播单存储 → 分享编码 → 二维码/链接 → 校验与确认 → 机核 API → 新播单
+GM 播单存储 → `/albums` 我的分类 → 本地卡片/详情 → CRUD、播放与封面更新
 ```
 
 ## 核心状态机与禁止流转
@@ -46,6 +56,8 @@ GM 播单存储 → 分享编码 → 二维码/链接 → 校验与确认 → �
 - 会员音频仅使用机核返回的临时授权地址；失败后允许用户重试。
 - 批量加入和分享导入按节目 ID 幂等；批量分页在全部成功后一次写入。
 - 专辑页先读取专辑类型和免费属性，再选择对应内容关系；分页结果按接口顺序合并，校验 `record-count` 后原子写入。
+- 播单封面只在本机 GM 存储中持久化；设置、替换和移除均复用现有保存与跨标签同步，不上传图片、不修改机核账号数据。
+- 官方结果只通过 `hidden` 临时隐藏；离开本地路由、React 换页或脚本失效时必须恢复，禁止清空官方 DOM。
 - 项目无服务端日志或遥测；错误只在当前页面显示。
 - 时刻评论只保存在当前页面内存中；分页任一请求失败时本次弹幕停用，不写入 Tampermonkey 播单数据。
 
@@ -56,7 +68,8 @@ GM 播单存储 → 分享编码 → 二维码/链接 → 校验与确认 → �
 - 分享数据不包含进度、账号或音频 URL。
 - 自定义播放不得绕过机核的登录与购买权限。
 - 弹幕层必须 `pointer-events:none`，不得阻挡时间轴、播放控制或评论操作。
+- 播单封面不得进入二维码、分享链接或机核接口请求。
 
 ## 关联需求、模块设计与验收
 
-设计覆盖 PRD 中 `REQ-PLAYLIST-001` 至 `REQ-DANMAKU-001`，对应验收项见 `docs/02-acceptance/acceptance-criteria.md`。
+设计覆盖当前 PRD；对应验收项见 `docs/02-acceptance/acceptance-criteria.md`。REQ-LIBRARY-001 / TASK-007 已被替代；REQ-CATALOG-001 对应 AC-CATALOG-001 和 TASK-008。

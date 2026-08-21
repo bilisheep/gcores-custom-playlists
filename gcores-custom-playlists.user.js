@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         机核自定义播单
 // @namespace    https://www.gcores.com/
-// @version      0.6.0
-// @description  独立多播单、断点进度、专辑批量加入、正倒序、二维码分享与时间轴评论弹幕
+// @version      0.7.0
+// @description  独立多播单、本地封面、断点进度、专辑批量加入、二维码分享与时间轴评论弹幕
 // @author       Codex
 // @match        https://www.gcores.com/*
 // @grant        GM_getValue
@@ -34,6 +34,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   const MAX_SHARE_ITEMS = 200;
   const MAX_SHARE_LINK_BYTES = 2800;
   const MAX_SHARE_ENCODED_LENGTH = 4000;
+  const MAX_COVER_FILE_BYTES = 8 * 1024 * 1024;
+  const MAX_COVER_DATA_LENGTH = 400 * 1024;
+  const COVER_SIZE = 320;
   const DANMAKU_LANES = 4;
   const DANMAKU_DURATION_MS = 8000;
   const DANMAKU_PAGE_SIZE = 100;
@@ -41,13 +44,14 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   const uid = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const TAB_ID = uid();
   const cleanText = (value, fallback = '') => typeof value === 'string' && value.trim() ? value.trim() : fallback;
+  const cleanCover = (value) => typeof value === 'string' && value.length <= MAX_COVER_DATA_LENGTH && /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value) ? value : '';
   const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   })[char]);
 
   function freshState() {
     const id = uid();
-    return { version: 1, activeId: id, playlists: [{ id, name: '我的播单', direction: 'asc', items: [], cursor: { itemId: null, time: 0 } }] };
+    return { version: 1, activeId: id, playlists: [{ id, name: '我的播单', cover: '', direction: 'asc', items: [], cursor: { itemId: null, time: 0 } }] };
   }
 
   function normalizeState(raw) {
@@ -73,6 +77,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       return {
         id,
         name: cleanText(list.name, '未命名播单'),
+        cover: cleanCover(list.cover),
         direction,
         items,
         cursor: {
@@ -100,6 +105,10 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 
   function orderedItems(list) {
     return list.direction === 'desc' ? [...list.items].reverse() : list.items;
+  }
+
+  function playlistCover(list) {
+    return list.cover || orderedItems(list)[0]?.cover || '';
   }
 
   function moveVisibleItem(list, itemId, offset) {
@@ -144,10 +153,11 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   }
 
   function selfCheck() {
-    const state = normalizeState({ activeId: 'x', playlists: [{ id: 'x', name: ' X ', items: [
+    const state = normalizeState({ activeId: 'x', playlists: [{ id: 'x', name: ' X ', cover: 'data:image/jpeg;base64,AAAA', items: [
       { id: '1', title: 'A', duration: -1 }, { id: '1', title: '重复项' }, { id: '2', title: 'B' },
     ], cursor: { itemId: '2', time: 12 } }] });
-    if (state.playlists[0].name !== 'X' || state.playlists[0].items.length !== 2) throw new Error('normalizeState failed');
+    if (state.playlists[0].name !== 'X' || state.playlists[0].cover !== 'data:image/jpeg;base64,AAAA' || state.playlists[0].items.length !== 2) throw new Error('normalizeState failed');
+    if (normalizeState({ playlists: [{ id: 'bad', cover: 'javascript:alert(1)' }] }).playlists[0].cover) throw new Error('playlist cover validation failed');
     if (moveItem(state.playlists[0].items, 0, 1)[0].id !== '2') throw new Error('moveItem failed');
     if (newItemsForPlaylist(state.playlists[0], [{ id: '2' }, { id: '3' }, { id: '3' }]).length !== 1) throw new Error('playlist deduplication failed');
     const descending = { direction: 'desc', items: [{ id: '1' }, { id: '2' }, { id: '3' }] };
@@ -191,6 +201,11 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   let playbackRequest = 0;
   let volumePopoverOpen = false;
   let miniSeekDragging = false;
+  let stateRevision = 0;
+  let pageStatus = '';
+  let catalogDelayTimer = 0;
+  // ponytail: 机核未暴露 hydration 完成信号；先等待 1.5 秒，未来有稳定信号时替换。
+  const catalogReadyAt = Date.now() + 1500;
   let danmakuEnabled = GM_getValue(DANMAKU_KEY, true) !== false;
   let danmakuSession = null;
   let danmakuRequest = 0;
@@ -200,7 +215,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   const savedVolume = Number(GM_getValue(VOLUME_KEY, 0.8));
   audio.volume = Number.isFinite(savedVolume) ? Math.min(1, Math.max(0, savedVolume)) : 0.8;
 
-  const save = () => GM_setValue(STORAGE_KEY, state);
+  const save = () => { stateRevision += 1; GM_setValue(STORAGE_KEY, state); };
   const activePlaylist = () => state.playlists.find((list) => list.id === state.activeId) || state.playlists[0];
   const playlistById = (id) => state.playlists.find((list) => list.id === id);
   const currentItem = () => playback && playlistById(playback.playlistId)?.items.find((item) => item.id === playback.itemId);
@@ -216,6 +231,35 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     const response = await fetch(`${API_ROOT}${path}`, { credentials: 'include' });
     if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? '请先登录机核，并确认你有权播放该节目' : `机核接口请求失败（${response.status}）`);
     return response.json();
+  }
+
+  function coverDataFromFile(file) {
+    if (!file?.type?.startsWith('image/')) return Promise.reject(new Error('请选择图片文件'));
+    if (file.size > MAX_COVER_FILE_BYTES) return Promise.reject(new Error('封面原图不能超过 8 MiB'));
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const image = new Image();
+      const done = (callback) => { URL.revokeObjectURL(url); callback(); };
+      image.onload = () => done(() => {
+        try {
+          if (!image.naturalWidth || !image.naturalHeight) throw new Error('无法读取这张图片');
+          const canvas = document.createElement('canvas');
+          canvas.width = COVER_SIZE;
+          canvas.height = COVER_SIZE;
+          const context = canvas.getContext('2d');
+          if (!context) throw new Error('浏览器无法处理这张图片');
+          const side = Math.min(image.naturalWidth, image.naturalHeight);
+          context.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, 0, 0, COVER_SIZE, COVER_SIZE);
+          const data = canvas.toDataURL('image/jpeg', 0.82);
+          if (!cleanCover(data)) throw new Error('压缩后的封面仍然过大');
+          resolve(data);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      image.onerror = () => done(() => reject(new Error('无法读取这张图片')));
+      image.src = url;
+    });
   }
 
   function parseRadio(data) {
@@ -269,33 +313,16 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       .miniInfo{display:grid;grid-template-columns:46px minmax(0,1fr);align-items:center;gap:10px;min-width:0}.miniCoverLink{display:block;width:46px;height:46px;border-radius:11px;transition:transform 140ms cubic-bezier(.23,1,.32,1)}.miniCoverLink:active{transform:scale(.96)}.miniCover,.miniPlaceholder{width:46px;height:46px;border-radius:11px;object-fit:cover;background:#303030}.miniPlaceholder{display:grid;place-items:center;color:#bbb}.miniPlaceholder svg{width:20px}.miniText{display:block;min-width:0;width:100%;padding:5px 7px;border:0;border-radius:8px;background:transparent;color:inherit;text-align:left}.miniText:hover{background:#ffffff0a}.miniTitle,.miniSub{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.miniTitle{font-weight:700}.miniSub{margin-top:2px;color:#bbb;font-size:11px}
       .miniControls{display:flex;align-items:center;gap:8px}.miniControl{display:grid;place-items:center;width:38px;height:38px;padding:0;border:1px solid #ffffff1f;border-radius:999px;background:#292929;color:#fff}.miniControl.primaryControl{width:42px;height:42px;background:#e05241;border-color:#e05241}.miniControl.primaryControl:hover{background:#ef5b48}.miniControl:disabled{cursor:default;opacity:.35}.miniControl svg{width:15px;height:15px}
       .miniVolumeWrap{position:relative;display:grid;place-items:center}.miniVolumeButton svg{width:17px;height:17px}.miniVolumePopover{position:absolute;right:50%;bottom:50px;z-index:4;display:flex;width:56px;height:162px;transform:translateX(50%);flex-direction:column;align-items:center;gap:6px;padding:10px 8px;border:1px solid #ffffff2e;border-radius:16px;background:rgba(20,20,20,.82);box-shadow:0 12px 30px #0008;backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%)}.miniVolumeValue{color:#ddd;font-size:10px;font-variant-numeric:tabular-nums}.miniVolumeSlider{width:32px;height:120px;margin:0;accent-color:#e05241;cursor:ns-resize;direction:rtl;touch-action:none;writing-mode:vertical-lr;-webkit-appearance:slider-vertical}.miniProgress{grid-column:1/-1;display:grid;grid-template-columns:42px minmax(0,1fr) 42px;align-items:center;gap:8px;min-width:0;color:#ccc;font-size:11px;font-variant-numeric:tabular-nums}.miniProgress span:last-child{text-align:right}.miniProgress input{width:100%;height:24px;margin:0;accent-color:#e05241;cursor:pointer}.miniProgress input:disabled{cursor:default;opacity:.45}.miniProgressEmpty{grid-column:1/-1}
-      #panel{position:absolute;left:50%;bottom:100px;display:none;width:min(390px,calc(100vw - 24px));max-height:min(720px,calc(100vh - 128px));overflow:hidden;transform:translateX(-50%);background:#181818;color:#eee;border:1px solid #ffffff1f;border-radius:16px;box-shadow:0 18px 60px #0009}
-      :host(.open) #panel{display:flex;flex-direction:column}
-      header,.toolbar,.now,.footer{padding:12px;border-bottom:1px solid #ffffff18}.footer{border:0;border-top:1px solid #ffffff18}
-      header{display:flex;align-items:center;gap:8px}header strong{flex:1;font-size:16px}
-      button,select{border:1px solid #ffffff24;border-radius:8px;background:#292929;color:#eee;padding:7px 9px}button:hover{background:#383838}.danger{color:#ff8d82}
-      .toolbar{display:grid;grid-template-columns:1fr auto auto auto;gap:7px}.toolbar select{min-width:0}
-      .actions{display:flex;gap:7px;margin-top:9px}.actions button{flex:1}.primary{background:#d94a3a;border-color:#d94a3a;color:#fff}.primary:hover{background:#ef5b48}
-      #items{overflow:auto;padding:8px 12px}.empty{padding:28px 8px;text-align:center;color:#999}
-      .item{display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px 0;border-bottom:1px solid #ffffff12}.item img{width:42px;height:42px;border-radius:7px;object-fit:cover;background:#333}.title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{color:#999;font-size:12px}.itemBtns{display:flex;gap:3px}.itemBtns button{padding:5px 7px;border:0;background:transparent}.playing .title{color:#ff7868}
-      .now{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px}.now img{width:48px;height:48px;border-radius:8px;object-fit:cover;background:#333}.nowTitle{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.progress{grid-column:1/-1;display:grid;grid-template-columns:42px 1fr 42px;gap:7px;align-items:center;font-size:11px;color:#aaa}.progress input{width:100%}
-      .controls{grid-column:1/-1;display:flex;justify-content:center;gap:8px}.controls button{min-width:48px}.status{grid-column:1/-1;color:#ffb4aa;font-size:12px;min-height:17px}
-      #share[hidden]{display:none}#share{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:14px;background:#000b;border-radius:16px}.shareCard{width:100%;max-height:100%;overflow:auto;padding:16px;border-radius:13px;background:#202020;text-align:center}.shareCard img{display:block;width:min(100%,330px);margin:0 auto 12px;border-radius:8px;background:#fff}.shareCard p{margin:7px 0;color:#aaa;font-size:12px}.shareActions{display:flex;gap:8px;margin-top:12px}.shareActions button{flex:1}
-      @media(max-width:520px){:host{bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px)}#mini{grid-template-columns:minmax(0,1fr) auto 40px;grid-template-rows:44px 26px;column-gap:8px;height:84px;padding:6px 8px}.miniInfo{grid-template-columns:42px minmax(0,1fr);gap:8px}.miniCoverLink,.miniCover,.miniPlaceholder{width:42px;height:42px}.miniSub{display:none}.miniControl{width:34px;height:34px}.miniControl.primaryControl{width:38px;height:38px}.miniVolumePopover{bottom:44px}.miniProgress{grid-template-columns:38px minmax(0,1fr) 38px;gap:5px}#panel{bottom:94px;max-height:calc(100vh - 116px)}}
+      #share[hidden]{display:none}#share{position:absolute;left:50%;bottom:100px;z-index:5;width:min(390px,calc(100vw - 24px));max-height:calc(100vh - 128px);overflow:auto;transform:translateX(-50%);padding:14px;border:1px solid #ffffff1f;border-radius:16px;background:#111e;box-shadow:0 18px 60px #0009}.shareCard{padding:16px;border-radius:13px;background:#202020;text-align:center}.shareCard img{display:block;width:min(100%,330px);margin:0 auto 12px;border-radius:8px;background:#fff}.shareCard p{margin:7px 0;color:#aaa;font-size:12px}.shareActions{display:flex;gap:8px;margin-top:12px}.shareActions button{flex:1;border:1px solid #ffffff24;border-radius:8px;background:#292929;color:#eee;padding:7px 9px}
+      @media(max-width:520px){:host{bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px)}#mini{grid-template-columns:minmax(0,1fr) auto 40px;grid-template-rows:44px 26px;column-gap:8px;height:84px;padding:6px 8px}.miniInfo{grid-template-columns:42px minmax(0,1fr);gap:8px}.miniCoverLink,.miniCover,.miniPlaceholder{width:42px;height:42px}.miniSub{display:none}.miniControl{width:34px;height:34px}.miniControl.primaryControl{width:38px;height:38px}.miniVolumePopover{bottom:44px}.miniProgress{grid-template-columns:38px minmax(0,1fr) 38px;gap:5px}#share{bottom:94px}}
       @media(prefers-reduced-motion:reduce){button,.miniCoverLink{transition:none}button:active,.miniCoverLink:active{transform:none}}
     </style>
     <div id="mini" aria-label="自定义播单播放器"></div>
-    <section id="panel" aria-label="机核自定义播单">
-      <header><strong>我的播单</strong><button data-action="close" aria-label="关闭">×</button></header>
-      <div class="toolbar" id="toolbar"></div>
-      <div id="items"></div>
-      <div class="now" id="now"></div>
-      <div id="share" hidden></div>
-    </section>`;
+    <div id="share" hidden></div>`;
 
   const style = document.createElement('style');
   style.id = 'gcpl-site-style';
-  style.textContent = `.gcpl-add-card{position:absolute!important;top:8px;right:44px;z-index:4;display:flex;width:28px;height:28px;align-items:center;justify-content:center;border:0;border-radius:4px;padding:0;background:#0003;color:#fff;cursor:pointer}.gcpl-add-card svg{width:15px;height:15px}.gcpl-add-card:hover{background:#e34d3b}.gcpl-add-card:disabled{opacity:.6}.gcpl-add-user-radios{display:block!important;width:100%;margin-top:10px}.original_imgArea{position:relative}.gcpl-danmaku-host{position:relative!important}.gcpl-danmaku-layer{position:absolute;inset:0;z-index:8;overflow:hidden;pointer-events:none}.gcpl-danmaku-item{position:absolute;left:0;display:inline-block;max-width:80vw;overflow:hidden;padding:7px 13px;border:1px solid #ffffff2e;border-radius:999px;background:rgba(14,14,14,.58);box-shadow:0 5px 18px #0006;color:#fff;font:600 15px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em;text-overflow:ellipsis;text-shadow:0 1px 2px #000;white-space:nowrap;will-change:transform,opacity;backdrop-filter:blur(12px) saturate(150%);-webkit-backdrop-filter:blur(12px) saturate(150%)}.gcpl-danmaku-item-static{left:50%;transform:translateX(-50%);max-width:min(760px,80vw)}.gcpl-danmaku-toggle{margin-left:8px!important}.gcpl-danmaku-toggle[aria-pressed="true"]{color:#fff!important;background:#ffffff24!important}@media(prefers-reduced-transparency:reduce){.gcpl-danmaku-item{background:#1b1b1bf2;backdrop-filter:none;-webkit-backdrop-filter:none}}@media(prefers-contrast:more){.gcpl-danmaku-item{background:#000;border-color:#fff}}`;
+  style.textContent = `.gcpl-catalogToolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:18px 0}.gcpl-catalogToolbar strong{font-size:16px}.gcpl-local-card{position:relative}.gcpl-local-card .coverShowcase{width:100%;text-align:left}.gcpl-local-card .coverShowcase_img{position:relative;display:grid;place-items:center;overflow:hidden;background:var(--gray-block-lighten-bg,#f7f7f8);color:var(--gray-side-list-icon,#81858d)}.gcpl-local-card .coverShowcase_img img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.gcpl-local-card .coverShowcase_img svg{position:absolute;top:36%;left:36%;width:28%;max-width:52px}.gcpl-cardMeta{margin-top:-4px;color:var(--gray-info,#8e8e93);font-size:12px}.gcpl-selfBadge{position:absolute;top:8px;left:8px;z-index:2;padding:3px 7px;border-radius:999px;background:#141414b8;color:#fff;font-size:11px}.gcpl-coverAction{position:absolute;top:8px;right:8px;z-index:2;display:grid;width:32px;height:32px;place-items:center;border:0;border-radius:999px;background:#141414b8;color:#fff;cursor:pointer;overflow:hidden}.gcpl-coverAction svg{width:15px}.gcpl-coverInput{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}.gcpl-coverAction:focus-within,.gcpl-inlineCover:focus-within{outline:2px solid var(--bs-highlight,#478cfe);outline-offset:2px}.gcpl-inlineCover{position:relative;overflow:hidden}.gcpl-removeCover{top:46px}.gcpl-pageStatus{min-height:20px;margin:10px 0;color:var(--bs-danger,#ff3d1d);font-size:13px}.gcpl-detailBack{margin:18px 0}.gcpl-detailHero{display:grid;grid-template-columns:minmax(160px,220px) minmax(0,1fr);gap:28px;align-items:start}.gcpl-detailCover{display:grid;aspect-ratio:1;place-items:center;overflow:hidden;border-radius:6px;background:var(--gray-block-lighten-bg,#f7f7f8);color:var(--gray-side-list-icon,#81858d)}.gcpl-detailCover img{width:100%;height:100%;object-fit:cover}.gcpl-detailCover svg{width:30%}.gcpl-detailInfo h1{margin:0 0 8px;font-size:28px}.gcpl-detailInfo p{color:var(--gray-info,#8e8e93)}.gcpl-detailActions{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}.gcpl-detailItems{margin-top:30px}.gcpl-detailItem{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:14px;align-items:center;padding:12px 0;border-top:1px solid var(--gray-separator,#f0f0f0)}.gcpl-detailItem img,.gcpl-detailItemPlaceholder{width:64px;height:64px;border-radius:6px;object-fit:cover;background:var(--gray-block-lighten-bg,#f7f7f8)}.gcpl-detailItemTitle{overflow:hidden;font-weight:700;text-overflow:ellipsis;white-space:nowrap}.gcpl-itemActions{display:flex;gap:4px}.gcpl-itemActions button{min-width:34px}.gcpl-playing .gcpl-detailItemTitle{color:var(--bs-gcores,#f83055)}@media(max-width:700px){.gcpl-detailHero{grid-template-columns:110px minmax(0,1fr);gap:16px}.gcpl-detailInfo h1{font-size:21px}.gcpl-detailItem{grid-template-columns:48px minmax(0,1fr)}.gcpl-detailItem img,.gcpl-detailItemPlaceholder{width:48px;height:48px}.gcpl-itemActions{grid-column:1/-1}}.gcpl-add-card{position:absolute!important;top:8px;right:44px;z-index:4;display:flex;width:28px;height:28px;align-items:center;justify-content:center;border:0;border-radius:4px;padding:0;background:#0003;color:#fff;cursor:pointer}.gcpl-add-card svg{width:15px;height:15px}.gcpl-add-card:hover{background:#e34d3b}.gcpl-add-card:disabled{opacity:.6}.gcpl-add-user-radios{display:block!important;width:100%;margin-top:10px}.original_imgArea{position:relative}.gcpl-danmaku-host{position:relative!important}.gcpl-danmaku-layer{position:absolute;inset:0;z-index:8;overflow:hidden;pointer-events:none}.gcpl-danmaku-item{position:absolute;left:0;display:inline-block;max-width:80vw;overflow:hidden;padding:7px 13px;border:1px solid #ffffff2e;border-radius:999px;background:rgba(14,14,14,.58);box-shadow:0 5px 18px #0006;color:#fff;font:600 15px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em;text-overflow:ellipsis;text-shadow:0 1px 2px #000;white-space:nowrap;will-change:transform,opacity;backdrop-filter:blur(12px) saturate(150%);-webkit-backdrop-filter:blur(12px) saturate(150%)}.gcpl-danmaku-item-static{left:50%;transform:translateX(-50%);max-width:min(760px,80vw)}.gcpl-danmaku-toggle{margin-left:8px!important}.gcpl-danmaku-toggle[aria-pressed="true"]{color:#fff!important;background:#ffffff24!important}@media(prefers-reduced-transparency:reduce){.gcpl-danmaku-item{background:#1b1b1bf2;backdrop-filter:none;-webkit-backdrop-filter:none}}@media(prefers-contrast:more){.gcpl-danmaku-item{background:#000;border-color:#fff}}`;
   document.head.append(style);
 
   function formatTime(seconds) {
@@ -307,31 +334,105 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}` : `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   }
 
+  function catalogRoute() {
+    if (location.pathname !== '/albums') return null;
+    const params = new URLSearchParams(location.search);
+    if (['gcores', 'join'].includes(params.get('filter'))) return null;
+    return { playlistId: cleanText(params.get('gcpl')) };
+  }
+
+  function navigateCatalog(playlistId = '') {
+    const url = new URL('/albums', location.origin);
+    if (playlistId) url.searchParams.set('gcpl', playlistId);
+    if (location.pathname !== '/albums') { location.href = url.href; return; }
+    history.pushState(history.state, '', url);
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    queueScan();
+  }
+
+  function restoreOfficialCatalog(section) {
+    section?.querySelectorAll(':scope > [data-gcpl-official-hidden]').forEach((node) => { node.hidden = node.dataset.gcplOfficialHidden === '1'; delete node.dataset.gcplOfficialHidden; });
+    section?.querySelector(':scope > #gcpl-page-root')?.remove();
+  }
+
+  function localCoverMarkup(cover) {
+    return cover ? `<img src="${escapeHtml(cover)}" alt="">` : '<svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M12.5 2v7.4a2.6 2.6 0 1 1-1.5-2.35V4.4L6.5 5.5v5.9A2.6 2.6 0 1 1 5 9.05V4.3z"/></svg>';
+  }
+
+  function renderCatalogRoot(root, playlistId = '') {
+    const playlist = playlistId && playlistById(playlistId);
+    if (playlistId && !playlist) {
+      history.replaceState(history.state, '', new URL('/albums', location.origin));
+      playlistId = '';
+    }
+    if (!playlistId) {
+      root.innerHTML = `<div class="gcpl-catalogToolbar"><strong>保存在本机的播单</strong><button class="btn btn-primary" data-action="new-list">新建播单</button></div>
+        <div class="gcpl-pageStatus" role="status" aria-live="polite">${escapeHtml(pageStatus)}</div>
+        <div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 row-cols-xxl-6 o_equalHeightRow">${state.playlists.map((list) => {
+          const cover = playlistCover(list);
+          const current = list.id === state.activeId;
+          return `<div class="col"><article class="gcpl-local-card">
+            <span class="gcpl-selfBadge">自建</span>
+            <button class="coverShowcase o_plainButton" data-action="open-list" data-id="${escapeHtml(list.id)}" aria-label="打开播单：${escapeHtml(list.name)}"><div class="albumGolden albumGolden-hideGolden"><div class="coverShowcase_img">${localCoverMarkup(cover)}</div></div><h3>${escapeHtml(list.name)}</h3><p class="gcpl-cardMeta">${list.items.length} 期${current ? ' · 当前播单' : ''}</p></button>
+            <label class="gcpl-coverAction" aria-label="${list.cover ? '更换' : '设置'}封面：${escapeHtml(list.name)}"><svg aria-hidden="true" viewBox="0 0 16 16"><path fill="currentColor" d="M5.2 3 6 1.8h4L10.8 3H14a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 14 14H2a1.5 1.5 0 0 1-1.5-1.5v-8A1.5 1.5 0 0 1 2 3zm2.8 9a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7m0-1.5a2 2 0 1 1 0-4 2 2 0 0 1 0 4"/></svg><input class="gcpl-coverInput" type="file" accept="image/*" data-id="${escapeHtml(list.id)}" aria-label="${list.cover ? '更换' : '设置'}封面：${escapeHtml(list.name)}"></label>
+            ${list.cover ? `<button class="gcpl-coverAction gcpl-removeCover" data-action="remove-cover" data-id="${escapeHtml(list.id)}" aria-label="移除封面：${escapeHtml(list.name)}">×</button>` : ''}
+          </article></div>`;
+        }).join('')}</div>`;
+      return;
+    }
+    const cover = playlistCover(playlist);
+    const visibleItems = orderedItems(playlist);
+    root.innerHTML = `<button class="btn btn-secondary gcpl-detailBack" data-action="open-library">← 我的播单</button>
+      <section class="gcpl-detailHero"><div class="gcpl-detailCover">${localCoverMarkup(cover)}</div><div class="gcpl-detailInfo"><span class="gcpl-selfBadge" style="position:static;display:inline-block">自建播单</span><h1>${escapeHtml(playlist.name)}</h1><p>${playlist.items.length} 期 · 排序：${playlist.direction === 'desc' ? '倒序' : '正序'}${playlist.cursor.time ? ` · 断点 ${formatTime(playlist.cursor.time)}` : ''}</p><div class="gcpl-detailActions"><button class="btn btn-primary" data-action="play-list"${playlist.items.length ? '' : ' disabled'}>从断点播放</button><button class="btn btn-secondary" data-action="toggle-order">切换为${playlist.direction === 'desc' ? '正序' : '倒序'}</button><button class="btn btn-secondary" data-action="rename-list">修改名字</button><label class="btn btn-secondary gcpl-inlineCover">${playlist.cover ? '更换封面' : '设置封面'}<input class="gcpl-coverInput" type="file" accept="image/*" data-id="${escapeHtml(playlist.id)}" aria-label="${playlist.cover ? '更换' : '设置'}封面：${escapeHtml(playlist.name)}"></label>${playlist.cover ? `<button class="btn btn-secondary" data-action="remove-cover" data-id="${escapeHtml(playlist.id)}">移除封面</button>` : ''}<button class="btn btn-secondary" data-action="share-list"${playlist.items.length ? '' : ' disabled'}>二维码分享</button><button class="btn btn-danger" data-action="delete-list">删除播单</button></div></div></section>
+      <div class="gcpl-pageStatus" role="status" aria-live="polite">${escapeHtml(pageStatus)}</div>
+      <section class="gcpl-detailItems"><h2>节目</h2>${visibleItems.length ? visibleItems.map((item) => `<article class="gcpl-detailItem ${playback?.playlistId === playlist.id && playback.itemId === item.id ? 'gcpl-playing' : ''}">${item.cover ? `<img src="${escapeHtml(item.cover)}" alt="">` : '<span class="gcpl-detailItemPlaceholder"></span>'}<div><div class="gcpl-detailItemTitle">${escapeHtml(item.title)}</div><div class="gcpl-cardMeta">${formatTime(item.duration)}${playlist.cursor.itemId === item.id && playlist.cursor.time ? ` · 断点 ${formatTime(playlist.cursor.time)}` : ''}</div></div><div class="gcpl-itemActions"><button class="btn btn-secondary" data-action="play-item" data-id="${item.id}" aria-label="播放：${escapeHtml(item.title)}">▶</button><button class="btn btn-secondary" data-action="move-up" data-id="${item.id}" aria-label="上移：${escapeHtml(item.title)}">↑</button><button class="btn btn-secondary" data-action="move-down" data-id="${item.id}" aria-label="下移：${escapeHtml(item.title)}">↓</button><button class="btn btn-danger" data-action="remove-item" data-id="${item.id}" aria-label="移除：${escapeHtml(item.title)}">×</button></div></article>`).join('') : '<p>还没有节目。可从节目卡片或用户页批量添加。</p>'}</section>`;
+  }
+
+  function scanCatalogPage(force = false) {
+    if (Date.now() < catalogReadyAt) {
+      if (!catalogDelayTimer) catalogDelayTimer = setTimeout(() => { catalogDelayTimer = 0; queueScan(); }, catalogReadyAt - Date.now());
+      return;
+    }
+    const filters = document.querySelector('.labelFilters ul');
+    const section = filters?.closest('.ah_section');
+    if (location.pathname !== '/albums' || !filters || !section) return;
+    let mine = filters.querySelector('.gcpl-mine-filter');
+    if (!mine) {
+      mine = document.createElement('li');
+      mine.className = 'gcpl-mine-filter';
+      mine.innerHTML = '<a data-key="mine" href="/albums">我的</a>';
+      mine.querySelector('a').addEventListener('click', (event) => { event.preventDefault(); navigateCatalog(); });
+      filters.prepend(mine);
+    }
+    const route = catalogRoute();
+    mine.classList.toggle('is_active', !!route);
+    if (!route) {
+      const filter = new URLSearchParams(location.search).get('filter') || 'gcores';
+      [...filters.children].forEach((item) => { if (item !== mine) item.classList.toggle('is_active', item.querySelector('a')?.dataset.key === filter); });
+      restoreOfficialCatalog(section);
+      return;
+    }
+    [...filters.children].forEach((item) => { if (item !== mine) item.classList.remove('is_active'); });
+    const title = filters.closest('.ah_title');
+    let root = section.querySelector(':scope > #gcpl-page-root');
+    [...section.children].forEach((node) => { if (node !== title && node !== root) { if (!('gcplOfficialHidden' in node.dataset)) node.dataset.gcplOfficialHidden = node.hidden ? '1' : '0'; node.hidden = true; } });
+    if (!root) { root = document.createElement('div'); root.id = 'gcpl-page-root'; title.insertAdjacentElement('afterend', root); }
+    const key = `${route.playlistId}|${stateRevision}|${playback?.playlistId || ''}:${playback?.itemId || ''}:${audio.paused}|${pageStatus}`;
+    if (!force && root.dataset.renderKey === key) return;
+    root.dataset.renderKey = key;
+    renderCatalogRoot(root, route.playlistId);
+  }
+
   function render() {
-    const list = activePlaylist();
-    const visibleItems = orderedItems(list);
-    shadow.querySelector('#toolbar').innerHTML = `
-      <select data-action="select-list" aria-label="选择播单">${state.playlists.map((item) => `<option value="${escapeHtml(item.id)}"${item.id === list.id ? ' selected' : ''}>${escapeHtml(item.name)}（${item.items.length}）</option>`).join('')}</select>
-      <button data-action="new-list" title="新建播单">＋</button><button data-action="rename-list">修改名字</button><button class="danger" data-action="delete-list">删除播单</button>
-      <div class="actions" style="grid-column:1/-1"><button data-action="toggle-order">排序：${list.direction === 'desc' ? '倒序' : '正序'}</button><button data-action="share-list"${list.items.length ? '' : ' disabled'}>二维码分享</button><button class="primary" data-action="play-list"${list.items.length ? '' : ' disabled'}>从断点播放</button></div>`;
-    shadow.querySelector('#items').innerHTML = visibleItems.length ? visibleItems.map((item) => `
-      <div class="item ${playback?.playlistId === list.id && playback.itemId === item.id ? 'playing' : ''}">
-        ${item.cover ? `<img src="${escapeHtml(item.cover)}" alt="">` : '<span></span>'}
-        <div><div class="title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div><div class="meta">${formatTime(item.duration)}${list.cursor.itemId === item.id && list.cursor.time ? ` · 断点 ${formatTime(list.cursor.time)}` : ''}</div></div>
-        <div class="itemBtns"><button data-action="play-item" data-id="${item.id}" title="播放">▶</button><button data-action="move-up" data-id="${item.id}" title="上移">↑</button><button data-action="move-down" data-id="${item.id}" title="下移">↓</button><button class="danger" data-action="remove-item" data-id="${item.id}" title="移除">×</button></div>
-      </div>`).join('') : '<div class="empty">还没有节目。可从节目卡片或用户页批量添加。</div>';
-    renderPlayer();
+    pageStatus = '';
+    renderMini();
+    scanCatalogPage(true);
   }
 
   function renderPlayer(message = '') {
-    const item = currentItem();
-    const duration = Number.isFinite(audio.duration) ? audio.duration : item?.duration || 0;
-    const time = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
-    shadow.querySelector('#now').innerHTML = item ? `
-      ${item.cover ? `<img src="${escapeHtml(item.cover)}" alt="">` : '<span></span>'}<div><div class="nowTitle">${escapeHtml(item.title)}</div><div class="meta">${audio.paused ? '已暂停' : '正在播放'}</div></div>
-      <div class="progress"><span id="elapsed">${formatTime(time)}</span><input id="seek" type="range" min="0" max="${Math.max(1, duration)}" step="1" value="${Math.min(time, duration || time)}"><span id="duration">${formatTime(duration)}</span></div>
-      <div class="controls"><button data-action="previous" title="上一期">⏮</button><button class="primary" data-action="toggle">${audio.paused ? '▶' : 'Ⅱ'}</button><button data-action="next" title="下一期">⏭</button></div><div class="status">${escapeHtml(message)}</div>` : `<span></span><div><div class="nowTitle">尚未播放</div><div class="meta">每个播单会分别保存节目和时间点</div></div><div class="status">${escapeHtml(message)}</div>`;
+    pageStatus = message;
     renderMini();
+    scanCatalogPage(true);
   }
 
   function renderMini() {
@@ -355,7 +456,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     shadow.querySelector('#mini').innerHTML = `
       <span class="miniInfo">
         ${displayItem ? `<a class="miniCoverLink" href="/radios/${escapeHtml(displayItem.id)}" target="_blank" rel="noopener noreferrer" aria-label="打开节目详情：${escapeHtml(displayItem.title)}">${displayItem.cover ? `<img class="miniCover" src="${escapeHtml(displayItem.cover)}" alt="">` : `<span class="miniPlaceholder">${musicIcon}</span>`}</a>` : `<span class="miniPlaceholder">${musicIcon}</span>`}
-        <button class="miniText" data-action="open-panel" aria-label="打开自定义播单"><span class="miniTitle">${escapeHtml(displayItem?.title || '播单为空')}</span><span class="miniSub">${escapeHtml(playbackLoading ? `${list?.name || '我的播单'} · 正在加载…` : playbackError ? `${list?.name || '我的播单'} · 加载失败，点击重试` : item ? `${list?.name || '我的播单'} · ${audio.paused ? '已暂停' : '正在播放'}` : displayItem ? `${list?.name || '我的播单'} · 从断点播放` : `${list?.name || '我的播单'} · 点击管理`)}</span></button>
+        <button class="miniText" data-action="open-current-list" data-id="${escapeHtml(list?.id || '')}" aria-label="打开播单详情：${escapeHtml(list?.name || '我的播单')}"><span class="miniTitle">${escapeHtml(displayItem?.title || '播单为空')}</span><span class="miniSub">${escapeHtml(playbackLoading ? `${list?.name || '我的播单'} · 正在加载…` : playbackError ? `${list?.name || '我的播单'} · 加载失败，点击重试` : item ? `${list?.name || '我的播单'} · ${audio.paused ? '已暂停' : '正在播放'}` : displayItem ? `${list?.name || '我的播单'} · 从断点播放` : `${list?.name || '我的播单'} · 点击管理`)}</span></button>
       </span>
       <span class="miniControls"><button class="miniControl primaryControl" data-action="mini-toggle" aria-label="${playbackLoading ? '正在加载' : item && !audio.paused ? '暂停' : playbackError ? '重试播放' : '播放'}"${canStart ? '' : ' disabled'}>${item && !audio.paused ? pauseIcon : playIcon}</button><button class="miniControl" data-action="mini-next" aria-label="下一期"${canNext ? '' : ' disabled'}>${nextIcon}</button></span>
       <span class="miniVolumeWrap"><button class="miniControl miniVolumeButton" data-action="toggle-volume" aria-label="调节音量" aria-expanded="${volumePopoverOpen}" aria-controls="miniVolumePopover">${volumeIcon}</button>${volumePopoverOpen ? `<span class="miniVolumePopover" id="miniVolumePopover" role="dialog" aria-label="音量调节"><span class="miniVolumeValue">${Math.round(audio.volume * 100)}%</span><input class="miniVolumeSlider" id="miniVolumeSlider" type="range" min="0" max="1" step="0.05" value="${audio.volume}" orient="vertical" aria-label="音量"></span>` : ''}</span>
@@ -363,7 +464,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   }
 
   function setStatus(message) {
-    const node = shadow.querySelector('.status');
+    pageStatus = message;
+    const node = document.querySelector('#gcpl-page-root .gcpl-pageStatus');
     if (node) node.textContent = message;
   }
 
@@ -417,8 +519,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     try {
       shared = decodeSharePayload(location.hash.slice(6));
     } catch (error) {
-      host.classList.add('open');
-      setStatus(error?.message || '无法识别分享播单');
+      alert(error?.message || '无法识别分享播单');
       clearShareHash();
       return;
     }
@@ -426,7 +527,6 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       clearShareHash();
       return;
     }
-    host.classList.add('open');
     const items = [];
     let failed = 0;
     for (let index = 0; index < shared.ids.length; index += 6) {
@@ -435,14 +535,14 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       batch.forEach((result) => result.status === 'fulfilled' ? items.push(result.value.item) : failed += 1);
     }
     clearShareHash();
-    if (!items.length) return setStatus('导入失败：未能取得任何节目资料');
+    if (!items.length) return alert('导入失败：未能取得任何节目资料');
     state = normalizeState(GM_getValue(STORAGE_KEY, state));
     const id = uid();
-    state.playlists.push({ id, name: shared.name, direction: 'asc', items, cursor: { itemId: items[0].id, time: 0 } });
+    state.playlists.push({ id, name: shared.name, cover: '', direction: 'asc', items, cursor: { itemId: items[0].id, time: 0 } });
     state.activeId = id;
     save();
-    render();
-    setStatus(`已导入 ${items.length} 期${failed ? `，${failed} 期获取失败` : ''}`);
+    pageStatus = `已导入 ${items.length} 期${failed ? `，${failed} 期获取失败` : ''}`;
+    navigateCatalog(id);
     } finally {
       importingShare = false;
     }
@@ -991,17 +1091,23 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   function queueScan() {
     if (scanQueued) return;
     scanQueued = true;
-    requestAnimationFrame(() => { scanCards(); scanUserPage(); scanAlbumPage(); scanDanmaku(); });
+    requestAnimationFrame(() => { scanCards(); scanCatalogPage(); scanUserPage(); scanAlbumPage(); scanDanmaku(); });
   }
 
-  shadow.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-action]');
-    if (!button) return;
+  function handleAction(button) {
     const action = button.dataset.action;
     if (!['close', 'toggle', 'previous', 'next', 'close-share', 'download-qr', 'copy-link'].includes(action)) state = normalizeState(GM_getValue(STORAGE_KEY, state));
-    const list = activePlaylist();
-    if (action === 'close') host.classList.remove('open');
-    if (action === 'open-panel') { volumePopoverOpen = false; render(); host.classList.add('open'); queueMicrotask(() => shadow.querySelector('[data-action="close"]')?.focus()); }
+    const list = playlistById(catalogRoute()?.playlistId) || activePlaylist();
+    if (action === 'open-current-list') navigateCatalog(button.dataset.id || list.id);
+    if (action === 'open-library') navigateCatalog();
+    if (action === 'open-list') {
+      const target = playlistById(button.dataset.id);
+      if (target) { state.activeId = target.id; save(); navigateCatalog(target.id); }
+    }
+    if (action === 'remove-cover') {
+      const target = playlistById(button.dataset.id);
+      if (target?.cover) { target.cover = ''; save(); render(); setStatus('已恢复自动封面'); }
+    }
     if (action === 'toggle-volume') {
       volumePopoverOpen = !volumePopoverOpen;
       renderMini();
@@ -1009,7 +1115,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     }
     if (action === 'new-list') {
       const name = cleanText(prompt('新播单名称：'));
-      if (name) { const id = uid(); state.playlists.push({ id, name, direction: 'asc', items: [], cursor: { itemId: null, time: 0 } }); state.activeId = id; save(); render(); }
+      if (name) { const id = uid(); state.playlists.push({ id, name, cover: '', direction: 'asc', items: [], cursor: { itemId: null, time: 0 } }); state.activeId = id; save(); navigateCatalog(id); }
     }
     if (action === 'rename-list') {
       const name = cleanText(prompt('播单名称：', list.name));
@@ -1020,7 +1126,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       if (!state.playlists.length) state = freshState();
       else state.activeId = state.playlists[0].id;
       if (playback?.playlistId === list.id) { playbackRequest += 1; audio.pause(); audio.removeAttribute('src'); expectedAudioUrl = ''; playbackLoading = false; playbackError = ''; playback = null; }
-      save(); render();
+      save(); navigateCatalog();
     }
     if (action === 'share-list') showShare(list);
     if (action === 'toggle-order') { list.direction = list.direction === 'desc' ? 'asc' : 'desc'; save(); render(); }
@@ -1061,11 +1167,43 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     }
     if (action === 'previous') adjacent(-1);
     if (action === 'next') adjacent(1);
+  }
+
+  shadow.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-action]');
+    if (button) handleAction(button);
+  });
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('#gcpl-page-root [data-action]');
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    handleAction(button);
   });
 
+  async function handleCoverChange(input) {
+    const file = input.files?.[0];
+    const targetId = input.dataset.id;
+    if (!file || !targetId) return;
+    setStatus('正在处理封面…');
+    try {
+      const cover = await coverDataFromFile(file);
+      state = normalizeState(GM_getValue(STORAGE_KEY, state));
+      const target = playlistById(targetId);
+      if (!target) throw new Error('目标播单已被删除');
+      target.cover = cover;
+      save();
+      render();
+      setStatus('封面已保存到本机');
+    } catch (error) {
+      setStatus(error?.message || '封面处理失败');
+    } finally {
+      input.value = '';
+    }
+  }
+
+  document.addEventListener('change', (event) => { if (event.target?.classList?.contains('gcpl-coverInput')) handleCoverChange(event.target); });
   shadow.addEventListener('change', (event) => {
-    if (event.target.dataset.action === 'select-list') { state = normalizeState(GM_getValue(STORAGE_KEY, state)); if (playlistById(event.target.value)) state.activeId = event.target.value; save(); render(); }
-    if (event.target.id === 'seek' && Number.isFinite(audio.duration)) { audio.currentTime = Math.min(Number(event.target.value), audio.duration); persistProgress(true); }
     if (event.target.id === 'miniSeek' && currentAudioSeekable()) persistProgress(true);
     if (event.target.id === 'miniVolumeSlider') setMiniVolume(event.target.value, true);
   });
@@ -1120,10 +1258,6 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   audio.addEventListener('pause', () => { persistProgress(true); renderPlayer(); });
   audio.addEventListener('timeupdate', () => {
     if (!miniSeekDragging) persistProgress();
-    const seek = shadow.querySelector('#seek');
-    const elapsed = shadow.querySelector('#elapsed');
-    if (seek) seek.value = String(audio.currentTime);
-    if (elapsed) elapsed.textContent = formatTime(audio.currentTime);
     const miniSeek = shadow.querySelector('#miniSeek');
     const miniElapsed = shadow.querySelector('#miniElapsed');
     if (miniSeek && !miniSeek.disabled) miniSeek.value = String(audio.currentTime);
@@ -1154,6 +1288,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   new MutationObserver(queueScan).observe(document.body, { childList: true, subtree: true });
   GM_addValueChangeListener(STORAGE_KEY, (_key, _oldValue, newValue, remote) => {
     if (!remote) return;
+    stateRevision += 1;
     state = normalizeState(newValue);
     if (playback && !playlistById(playback.playlistId)?.items.some((item) => item.id === playback.itemId)) {
       audio.pause();
@@ -1187,6 +1322,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (remote) setDanmakuEnabled(newValue !== false);
   });
   addEventListener('hashchange', importSharedPlaylist);
+  addEventListener('popstate', queueScan);
   queueScan();
   render();
   setTimeout(importSharedPlaylist, 0);
