@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "机核自定义播单",
+  "version": "0.8.0",
+  "description": "在机核网页端提供本地多播单、断点续播、自定义封面、批量加入、二维码分享与时间轴弹幕。",
+  "permissions": [
+    "storage",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://www.gcores.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.gcores.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

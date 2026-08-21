@@ -1,6 +1,6 @@
 # 机核自定义播单
 
-一个运行在 [机核 GCORES](https://www.gcores.com/) 网页端的 Tampermonkey 用户脚本，用独立的多播单、断点续播和二维码分享替代体验有限的原生播放队列。
+一个运行在 [机核 GCORES](https://www.gcores.com/) 网页端的 Tampermonkey 用户脚本与 Chrome/Edge 扩展，用独立的多播单、断点续播和二维码分享替代体验有限的原生播放队列。
 
 > 本项目为非官方工具，与机核 GCORES 无隶属或合作关系。
 
@@ -54,6 +54,10 @@
 
 ## 前置条件与安装
 
+油猴版和扩展版功能相同，请只启用其中一种。
+
+### Tampermonkey
+
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome、Edge、Firefox 或 Safari）。
 2. 点击 [安装脚本](https://github.com/bilisheep/gcores-custom-playlists/raw/refs/heads/main/gcores-custom-playlists.user.js)。
 3. Tampermonkey 打开安装页后，确认脚本权限并点击“安装”。
@@ -61,14 +65,24 @@
 
 也可以在 Tampermonkey 中新建脚本，将 [`gcores-custom-playlists.user.js`](gcores-custom-playlists.user.js) 的完整内容粘贴后保存。
 
+### Chrome / Edge 扩展
+
+1. 从 [最新 GitHub Release](https://github.com/bilisheep/gcores-custom-playlists/releases/latest) 下载 `gcores-custom-playlists-v0.8.0-chrome-edge.zip` 并解压到一个长期保留的目录。
+2. Chrome 打开 `chrome://extensions`；Edge 打开 `edge://extensions`。
+3. 开启“开发者模式”，选择“加载已解压的扩展程序”，选中包含 `manifest.json` 的解压目录。
+4. 禁用本项目的 Tampermonkey 脚本，然后刷新机核页面。
+
+扩展未上架浏览器商店，因此必须通过开发者模式安装。更新时请覆盖同一个解压目录，再到扩展管理页点击“重新加载”；移动到新目录可能改变扩展 ID 并产生新的空存储。
+
 ## 配置
 
-无需 API Key、服务器或构建步骤。脚本使用机核网页现有登录态访问节目资料和音频授权：
+无需 API Key 或服务器。油猴版与扩展版都会使用机核网页现有登录态访问节目资料和音频授权：
 
 - 播放公开节目无需额外配置。
 - 播放会员或付费节目时，需要先在机核网页登录具备对应权限的账号。
-- 播单、进度和音量保存在 Tampermonkey 本地存储中，不会上传到第三方服务器。
-- 自定义播单封面同样仅保存在 Tampermonkey，本地封面不会进入二维码或分享链接。
+- 油猴版把播单、进度、音量和封面保存在 Tampermonkey；扩展版使用独立的 `chrome.storage.local`。
+- 扩展首次安装为空播单，不读取或迁移 Tampermonkey 数据；两种存储互不影响。
+- 本地封面不会进入二维码或分享链接。
 - 多个机核标签页会同步播单和音量，并避免同时播放。
 
 ## 启动与使用
@@ -118,7 +132,7 @@
 
 1. 打开本地播单完整详情页，点击“二维码分享”。
 2. 下载二维码，或复制分享链接。
-3. 接收者需先安装本脚本，再扫描二维码或打开链接。
+3. 接收者需先安装油猴版或扩展版，再扫描二维码或打开链接。
 4. 机核页面会显示导入确认；确认后脚本根据节目 ID 获取最新节目资料并创建新播单。
 
 二维码只包含播单名称和节目 ID，不包含播放进度、账号信息或音频地址。
@@ -128,7 +142,7 @@
 1. 使用机核官方播放器打开某期节目，并进入全屏时间轴。
 2. 脚本会分页加载该节目全部带“时刻”标记的公开评论。
 3. 播放经过评论的 `radio-timestamp` 时，评论正文会在时间轴区域从右向左移动。
-4. 右上角“弹幕：开/关”控制是否显示弹幕；设置保存在 Tampermonkey 本地存储中。
+4. 右上角“弹幕：开/关”控制是否显示弹幕；设置保存在当前油猴或扩展的浏览器本地存储中。
 
 弹幕正文会移除开头时间文本并最多显示 80 个 Unicode 字符。弹幕最多同时占用 4 条轨道，轨道满时直接丢弃而不会延迟刷屏。暂停会冻结弹幕；seek 会清空当前弹幕且不补发跳过区间，向后 seek 后再次经过相应时刻可以重播。系统启用“减少动态效果”时，弹幕改为短暂静态显示。
 
@@ -140,16 +154,22 @@
 - 机核页面结构或非公开 API 变化可能导致部分功能失效。
 - 弹幕只作用于机核官方全屏时间轴，不显示在自定义底部播放器上；只使用接口返回的结构化时刻评论。
 - 专辑一键加入只显示在音频专辑；视频专辑不处理。
-- 封面原图必须是浏览器可读取的图片且不超过 8 MiB；多张封面会占用 Tampermonkey 本地空间。
+- 封面原图必须是浏览器可读取的图片且不超过 8 MiB；多张封面会占用浏览器本地空间。
+- 扩展仅支持 Chrome 和 Edge；不提供商店安装、Firefox/Safari 扩展或 Tampermonkey 数据迁移。
+- v0.8.0 已在 Chrome 151 真机加载验证；Edge 使用同一 Chromium MV3 包，本次按用户要求未单独实测。
 
 ## 运行测试
 
-无需安装依赖。使用 Node.js 执行语法检查和内置逻辑自检：
+无需安装 npm 依赖。使用 Node.js 执行语法、自检、存储桥和扩展构建：
 
 ```bash
 node --check gcores-custom-playlists.user.js
 node -e "globalThis.__GCPL_TEST__=true; require('./gcores-custom-playlists.user.js'); if (!globalThis.__GCPL_TEST_RESULT__) process.exit(1); console.log('self-check passed')"
+node scripts/test-extension-shim.mjs
+node scripts/build-extension.mjs
 ```
+
+构建结果位于 `dist/chrome-edge/`，Release ZIP 和 `.sha256` 位于 `dist/`。打包需要系统提供 `zip` 命令。
 
 ## 关键文档
 

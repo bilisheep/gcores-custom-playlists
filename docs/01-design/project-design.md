@@ -2,18 +2,19 @@
 
 ## 设计目标、优先级与明确取舍
 
-优先保证单文件、无服务器、权限不绕过和数据不丢失。项目使用独立 `HTMLAudioElement`，不耦合机核私有 Redux/React 状态；代价是需要自行管理队列、授权地址和断点。
+优先保证单一业务源码、无服务器、权限不绕过和数据不丢失。项目使用独立 `HTMLAudioElement`，不耦合机核私有 Redux/React 状态；代价是需要自行管理队列、授权地址、断点和两种本地存储适配。
 
 ## 系统组成与边界
 
 - 页面适配层：MutationObserver 扫描机核 SPA 页面，挂载卡片和用户页入口。
-- 播单状态层：Tampermonkey `GM_*` 存储版本化播单、断点、音量和跨标签播放信号。
+- 播单状态层：Tampermonkey `GM_*` 或扩展 `chrome.storage.local` 兼容桥存储版本化播单、断点、音量和跨标签播放信号；两者互不迁移。
 - 数据访问层：只读调用机核节目详情、搜索和受保护媒体授权接口。
 - 播放层：单一 `Audio` 实例负责载入、播放、跳转、错误和 Media Session。
 - UI 层：Shadow DOM 隔离底部播放器和二维码界面；本地播单库与详情作为官方 `/albums` 主内容区的普通 DOM sibling。
 - 时间轴弹幕层：挂载到官方 `.playerFullscreenTimelineBody`，读取官方 `<audio>` 的播放事件和 `currentTime`，只在全屏时间轴生命周期内存在。
 - 专辑导入层：识别 `/albums/{id}` 和 `content-type=radio`，分页读取官方已发布音频关系，完整成功后写入当前播单。
 - 官方播单页集成层：在 `/albums` 的 `.labelFilters ul` 首位挂载“我的”，并在本地路由下以独立 sibling 容器替换主内容展示；官方 filter 页面不改动原列表、分页或接口。
+- 分发层：Manifest V3、存储兼容桥和 Node 标准库构建脚本将同一用户脚本生成 Chromium 内容脚本；Chrome/Edge 共用一个 ZIP。
 
 ## 功能模块划分与协作
 
@@ -34,6 +35,8 @@
 本地详情使用 `/albums?gcpl={playlistId}`，同样占 `.ah_section` 主内容区，并复用 albumDetail 的封面、标题、操作区和节目列表视觉；库到详情使用 History API，`popstate`、SPA 扫描和刷新均按 URL 恢复。ID 无效时 `replaceState` 回 `/albums`。固定 Shadow host 只保留底栏、音量和二维码等二级界面，不再承载播单库或管理详情。
 
 图片选择复用隐藏的原生 file input、Object URL、Image 和 Canvas：限制原始文件为图片且不超过 8 MiB，按中心裁切为 320×320 JPEG，再限制 data URL 长度约 300 KiB。处理成功后重新读取 GM 状态并按 playlist ID 写入，避免覆盖跨标签页变化；失败只更新当前状态提示。
+
+扩展构建先读取 Manifest、兼容桥和用户脚本，校验三者版本，再把业务脚本嵌入兼容桥的异步启动点。兼容桥等待 `chrome.storage.local.get(null)`，在内存中实现同步 `GM_getValue`，把 `GM_setValue` 异步写回存储，并用本地写入队列抑制同标签 `storage.onChanged` 回声；其他标签变化以 `remote=true` 通知现有监听器。Manifest 仅声明 `storage`、`unlimitedStorage` 和 `https://www.gcores.com/*` 内容脚本。
 
 ## 核心数据流
 
@@ -56,10 +59,10 @@ GM 播单存储 → `/albums` 我的分类 → 本地卡片/详情 → CRUD、�
 - 会员音频仅使用机核返回的临时授权地址；失败后允许用户重试。
 - 批量加入和分享导入按节目 ID 幂等；批量分页在全部成功后一次写入。
 - 专辑页先读取专辑类型和免费属性，再选择对应内容关系；分页结果按接口顺序合并，校验 `record-count` 后原子写入。
-- 播单封面只在本机 GM 存储中持久化；设置、替换和移除均复用现有保存与跨标签同步，不上传图片、不修改机核账号数据。
+- 播单封面只在当前 `GM_*` 或 `chrome.storage.local` 适配中持久化；设置、替换和移除均复用现有保存与跨标签同步，不上传图片、不修改机核账号数据。
 - 官方结果只通过 `hidden` 临时隐藏；离开本地路由、React 换页或脚本失效时必须恢复，禁止清空官方 DOM。
 - 项目无服务端日志或遥测；错误只在当前页面显示。
-- 时刻评论只保存在当前页面内存中；分页任一请求失败时本次弹幕停用，不写入 Tampermonkey 播单数据。
+- 时刻评论只保存在当前页面内存中；分页任一请求失败时本次弹幕停用，不写入油猴或扩展的播单数据。
 
 ## 项目级不变量
 
@@ -69,7 +72,8 @@ GM 播单存储 → `/albums` 我的分类 → 本地卡片/详情 → CRUD、�
 - 自定义播放不得绕过机核的登录与购买权限。
 - 弹幕层必须 `pointer-events:none`，不得阻挡时间轴、播放控制或评论操作。
 - 播单封面不得进入二维码、分享链接或机核接口请求。
+- 扩展生成目录和 ZIP 是构建产物，不是第二份业务源码；Release 不包含私钥、账号数据或 Tampermonkey 存储。
 
 ## 关联需求、模块设计与验收
 
-设计覆盖当前 PRD；对应验收项见 `docs/02-acceptance/acceptance-criteria.md`。REQ-LIBRARY-001 / TASK-007 已被替代；REQ-CATALOG-001 对应 AC-CATALOG-001 和 TASK-008。
+设计覆盖当前 PRD；对应验收项见 `docs/02-acceptance/acceptance-criteria.md`。REQ-LIBRARY-001 / TASK-007 已被替代；REQ-CATALOG-001 对应 AC-CATALOG-001 和 TASK-008；REQ-EXTENSION-001 对应 AC-EXTENSION-001 和 TASK-009。

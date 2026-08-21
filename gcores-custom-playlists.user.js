@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         机核自定义播单
 // @namespace    https://www.gcores.com/
-// @version      0.7.0
+// @version      0.8.0
 // @description  独立多播单、本地封面、断点进度、专辑批量加入、二维码分享与时间轴评论弹幕
 // @author       Codex
 // @match        https://www.gcores.com/*
@@ -184,6 +184,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     globalThis.__GCPL_TEST_RESULT__ = selfCheck();
     return;
   }
+
+  if (document.querySelector('#gcpl-root')) return;
 
   let state = normalizeState(GM_getValue(STORAGE_KEY, null));
   let playback = null;
